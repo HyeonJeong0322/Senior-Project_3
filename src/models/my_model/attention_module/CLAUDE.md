@@ -53,29 +53,43 @@ python visualize_embeddings.py
 
 ---
 
-## 모델 아키텍처 (DILIGCNModel)
+## 모델 아키텍처 (DILIGCNModel) — Crossed Attention 재설계 (2026-03-27)
 
 ```
 SMILES
   │
-  ├─[Path A: Global]──────────────────────────────────────────────────────┐
-  │  MACCS(167) + Morgan ECFP6(512) = 679-dim                             │
-  │  → RF Feature Selection (K-Fold 외부 1회 고정) → 128-dim              │
-  │  → ProjectionBlock (Linear → LayerNorm → ReLU → Dropout) → 128-dim   │
-  │                                                                        ▼
-  │                                                              Concat(fp_proj ‖ z_gcn)
-  │                                                                   256-dim
-  │                                                                        │
-  └─[Path B: Local/GCN]──────────────────────────────────────────────────>│
-     원자 피처(25-dim) + 인접 행렬                                          │
-     → 1-Layer GCN (GCN_HIDDEN=64 → GCN_OUT=128)                         │
-     → GraphAttentionReadout                                              │
-       (Differential Attention: λ = sigmoid(λq·λk) 로 노이즈 상쇄)        │
-     → 128-dim 분자 벡터                                                   │
-                                                                           ▼
-                                                              MLP Classifier
-                                                        (128 → 128 → 2, Softmax)
+  ├─[Path A: Global]─────────────────────────────────────────────────────────────────┐
+  │  MACCS(167) + Morgan ECFP6(512) = 679-dim                                        │
+  │  → RF Feature Selection (K-Fold 외부 1회 고정) → 128-dim                         │
+  │  → ProjectionBlock (Linear → LayerNorm → ReLU → Dropout) → fp_vec (128-dim)     │
+  │                                                                                   │
+  └─[Path B: Local/GCN]──────────────────────────────────────────────────────────────┤
+     원자 피처(25-dim) + 인접 행렬                                                     │
+     → 1-Layer GCN (GCN_HIDDEN=64 → GCN_OUT=128) → node_mat (B, N, 128)            │
+     │                                                                                │
+     │  [Crossed Attention Pass 2: GCN → FP 방향]                                   │
+     │  NodeFPCrossAttention                                                          │
+     │    각 원자_i: gate_i = σ(W_q(node_i)·W_k(fp_vec)/√d)                         │
+     │    node_i += gate_i * W_v(fp_vec)                                             │
+     │    → 독성기 원자: FP와 공명 → gate↑ / 노이즈 원자: gate≈0                    │
+     │  → node_mat_fp (B, N, 128)                                                    │
+     │                                                                                │
+     │  [Crossed Attention Pass 1: FP → GCN 방향]                                   │
+     │  GraphAttentionReadout (fp_vec as Query, node_mat_fp as K/V)                  │
+     │    A_diff = A1 - λ*A2  (Differential: 노이즈 원자 상쇄)                       │
+     │  → z_readout (128-dim)                                                        │
+     │                                                                                │
+     └──────────────────────────────────────── Concat(fp_vec ‖ z_readout) ──────────┘
+                                                        256-dim
+                                                           │
+                                                  MLP Classifier
+                                            (256 → 128 → 2, Softmax)
 ```
+
+**Crossed Attention 설계 원칙:**
+- Pass 2 입력은 반드시 **순수 GCN node_mat** (fp_vec 개입 전) → FP 편향 방지
+- FP 단일 토큰에는 Softmax 대신 **Sigmoid 게이팅** → 단일 원소 Softmax 상수화 방지
+- Pass 1 Readout은 Pass 2로 업데이트된 node_mat_fp 사용 → 더 풍부한 원자 표현 참조
 
 ---
 
@@ -135,10 +149,12 @@ SMILES
 ### Training Curve 불안정
 | 원인 | 위치 |
 |------|------|
-| Fold마다 다른 RF Feature index → 입력 공간 불일치 | `train_dl_model.py` (수정 완료) |
-| Warmup 없는 CosineAnnealingLR → 초반 loss spike | `train_dl_model.py` (OneCycleLR로 교체 완료) |
+| Fold마다 다른 RF Feature index → 입력 공간 불일치 | `train_dl_model.py` (K-Fold 외부 1회 수행으로 수정 완료) |
+| Warmup 없는 CosineAnnealingLR → 초반 loss spike | `train_dl_model.py` (LinearLR+CosineAnnealingLR SequentialLR로 교체 완료) |
 | FF_DROPOUT=0.5로 train loss 인위적 진동 | `config.py` (0.3으로 완화 완료) |
 | pos_weight 동적 계산 → Fold 간 loss scale 변동 | `train_dl_model.py` (구조적 허용, 모니터링) |
+| EarlyStopping val_loss 기준 → Dropout으로 왜곡 | `train_dl_model.py` (val_AUC 최대화 기준으로 수정 완료) |
+| 앙상블 임베딩 추출을 별도 루프로 수행 → 모델 5회 재로드 | `train_dl_model.py` (Fold 학습 직후 즉시 추출로 통합 완료) |
 
 ### Val/Train Loss Gap 미해소
 | 원인 | 위치 |

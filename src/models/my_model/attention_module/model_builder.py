@@ -21,6 +21,7 @@ from attention_module import (
     CrossedDiffAttentionStack,
     OneLayerGCN,
     GraphAttentionReadout,
+    NodeFPCrossAttention,
     ProjectionBlock,
 )
 import config
@@ -97,22 +98,27 @@ class DILIAttentionModel(nn.Module):
 
 class DILIGCNModel(nn.Module):
     """
-    신규 파이프라인 (1-Layer GCN + Graph Attention Readout):
+    신규 파이프라인 (1-Layer GCN + 진짜 Crossed Attention):
 
-    fp_input (B, fp_dim)                  → ProjectionBlock → fp_proj (B, PROJECT_DIM)
-    graph (B,N,feat), adj (B,N,N), mask   → OneLayerGCN    → node_mat (B, N, GCN_OUT_DIM)
+    fp_input (B, fp_dim)                  → ProjectionBlock   → fp_vec   (B, PROJECT_DIM)
+    graph (B,N,feat), adj (B,N,N), mask   → OneLayerGCN       → node_mat (B, N, GCN_OUT_DIM)
 
-    fp_proj + node_mat → GraphAttentionReadout → z_readout (B, PROJECT_DIM)
+    [Crossed Attention — 양방향 독립 스트림]
+      Pass 2: Node_i(Q) → fp_vec(K,V) → node_mat_updated  (각 원자가 전역 FP 참조)
+      Pass 1: fp_vec(Q) → node_mat_updated(K,V) → z_readout (FP가 FP-informed 원자 참조)
 
-    Concat([fp_proj, z_readout]) → (B, 2*PROJECT_DIM)
+    Concat([fp_vec, z_readout]) → (B, 2*PROJECT_DIM)
     └─ [학습 시] → MLPClassifier → logits (B, 2)
     └─ [추출 시] → return_embedding=True → (B, 2*PROJECT_DIM) [= final_embeddings.npy]
 
-    설계 철학:
-      - FP(Q)가 분자의 전역 형태를 파악한 채, GCN 노드(K,V)를 순회하며
-        독성 패턴(Toxicophore)이 있는 정확한 원자 이웃에 집중.
-      - Differential Attention이 노이즈 원자 가중치를 차감(-), 핵심 원자를 증폭.
-      - Z_readout: 농축된 독성 시그널 → Concat 후 Person B(XGBoost)에 전달.
+    설계 철학 (Crossed Attention 재설계):
+      - 기존 단방향: FP → GCN (FP만 GCN을 봄)
+      - 신규 양방향:
+          Pass 2 (NodeFPCrossAttention): 각 원자_i가 전역 FP를 gate로 흡수
+            → 독성기 원자: FP와 강하게 공명 → 높은 gate → self 강화
+            → 노이즈 원자: FP와 무관 → gate ≈ 0 → 자동 억제
+          Pass 1 (GraphAttentionReadout): FP가 이미 FP-정보를 흡수한 원자들 참조
+            → 순환 편향 없음: Pass 2 입력은 순수 GCN node_mat (fp_vec 개입 전)
     """
     def __init__(self, fp_dim: int):
         super().__init__()
@@ -127,7 +133,14 @@ class DILIGCNModel(nn.Module):
             dropout = config.FF_DROPOUT,
         )
 
-        # ③ Graph Attention Readout (Differential weighted-sum over atoms)
+        # ③ Crossed Attention Pass 2: 각 원자가 전역 FP를 참조 (GCN → FP 방향)
+        self.node_fp_cross = NodeFPCrossAttention(
+            node_dim = config.GCN_OUT_DIM,
+            fp_dim   = config.PROJECT_DIM,
+            dropout  = config.ATTN_DROPOUT,
+        )
+
+        # ④ Crossed Attention Pass 1: FP가 FP-informed 원자들을 참조 (FP → GCN 방향)
         self.readout = GraphAttentionReadout(
             query_dim = config.PROJECT_DIM,
             node_dim  = config.GCN_OUT_DIM,
@@ -135,10 +148,10 @@ class DILIGCNModel(nn.Module):
             dropout   = config.ATTN_DROPOUT,
         )
 
-        # Concat 출력 차원: FP proj + Z_readout
+        # Concat 출력 차원: fp_vec + z_readout
         self.output_dim = config.PROJECT_DIM * 2   # (B, 2 * PROJECT_DIM)
 
-        # ④ Auxiliary MLP Head (학습 전용)
+        # ⑤ Auxiliary MLP Head (학습 전용)
         self.classifier = MLPClassifier(
             input_dim   = self.output_dim,
             hidden_dim  = config.MLP_HIDDEN_DIM,
@@ -160,22 +173,27 @@ class DILIGCNModel(nn.Module):
         return_embedding=True  → (B, 2*PROJECT_DIM) 임베딩 [final_embeddings.npy]
         return_embedding=False → (B, 2) 로짓
         """
-        # ① FP 투영
-        fp_vec = self.fp_proj(fp)             # (B, PROJECT_DIM)
+        # ① FP 투영 (순수 전역 특징)
+        fp_vec   = self.fp_proj(fp)            # (B, PROJECT_DIM)
 
-        # ② GCN: 위상 보존 로컬 원자 인코딩
-        node_mat = self.gcn(x, adj, mask)     # (B, max_N, GCN_OUT_DIM)
+        # ② GCN: 위상 보존 로컬 원자 인코딩 (순수 구조 정보, fp_vec 개입 없음)
+        node_mat = self.gcn(x, adj, mask)      # (B, max_N, GCN_OUT_DIM)
 
-        # ③ Attention Readout: 독성 원자에 집중, 노이즈 상쇄
-        z_readout = self.readout(fp_vec, node_mat, mask)   # (B, PROJECT_DIM)
+        # ③ Crossed Attention Pass 2: 각 원자가 전역 FP 맥락을 참조하여 자신을 업데이트
+        #    입력: 순수 GCN node_mat  →  FP 편향 없이 독립 스트림 유지
+        node_mat_fp = self.node_fp_cross(node_mat, fp_vec, mask)  # (B, max_N, GCN_OUT_DIM)
 
-        # ④ Concat: 전역 + 국소 융합 벡터 (최종 임베딩)
-        fused = torch.cat([fp_vec, z_readout], dim=-1)    # (B, 2*PROJECT_DIM)
+        # ④ Crossed Attention Pass 1: FP가 FP-정보를 흡수한 원자들을 참조
+        #    node_mat_fp는 이미 전역 맥락을 반영했으므로 Readout 품질 향상
+        z_readout = self.readout(fp_vec, node_mat_fp, mask)        # (B, PROJECT_DIM)
+
+        # ⑤ Concat: 전역(fp_vec) + 교차 참조된 국소(z_readout) 융합 벡터
+        fused = torch.cat([fp_vec, z_readout], dim=-1)             # (B, 2*PROJECT_DIM)
 
         if return_embedding:
-            return fused   # → final_embeddings.npy (Person B용)
+            return fused
 
-        return self.classifier(fused)   # (B, 2) 학습용 로짓
+        return self.classifier(fused)
 
 
 # ─────────────────────────────────────────────────────────────

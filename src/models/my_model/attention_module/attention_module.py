@@ -193,6 +193,68 @@ class GraphAttentionReadout(nn.Module):
 
 
 
+# ─────────────────────────────────────────────────────────────
+# [NEW] Cross Attention Pass 2: 각 원자(Node)가 전역 FP를 참조
+# ─────────────────────────────────────────────────────────────
+
+class NodeFPCrossAttention(nn.Module):
+    """
+    Crossed Attention Pass 2:
+        GCN 각 원자(Node_i)가 전역 FP 벡터를 참조하여 자신을 업데이트.
+
+    Pass 1 (GraphAttentionReadout) : FP(Q)    → N개 원자(K,V) → z_readout
+    Pass 2 (이 모듈)               : Node_i(Q) → FP(K,V)      → node_mat_updated
+
+    설계 근거 — Sigmoid 게이팅:
+        FP는 단일 토큰(시퀀스 길이 = 1)이므로 Softmax를 쓰면
+        항상 1.0으로 수렴 → 게이팅이 상수화됨.
+        Sigmoid 게이팅은 각 원자_i가 전역 FP 맥락을 얼마나 반영할지
+        독립적으로 [0, 1] 범위로 학습:
+            gate_i = σ( W_q(node_i) · W_k(fp) / √d )
+            node_i += gate_i * W_v(fp)
+
+    결과:
+        독성기(Toxicophore) 원자는 FP 전역 패턴과 강하게 공명 → 높은 gate
+        노이즈 원자는 FP와 무관 → gate ≈ 0 (자동 억제)
+    """
+    def __init__(self,
+                 node_dim: int   = config.GCN_OUT_DIM,
+                 fp_dim:   int   = config.PROJECT_DIM,
+                 dropout:  float = config.ATTN_DROPOUT):
+        super().__init__()
+        self.W_q   = nn.Linear(node_dim, node_dim, bias=False)
+        self.W_k   = nn.Linear(fp_dim,   node_dim, bias=False)
+        self.W_v   = nn.Linear(fp_dim,   node_dim, bias=False)
+        self.norm  = nn.LayerNorm(node_dim)
+        self.drop  = nn.Dropout(dropout)
+        self.scale = math.sqrt(node_dim)
+
+    def forward(self,
+                node_mat: torch.Tensor,
+                fp_vec:   torch.Tensor,
+                mask:     torch.Tensor) -> torch.Tensor:
+        """
+        node_mat : (B, N, node_dim) — GCN 출력 원자 행렬
+        fp_vec   : (B, fp_dim)      — 투영된 전역 FP 벡터 (단일 토큰)
+        mask     : (B, N)           — 유효 원자 True, 패딩 False
+        return   : (B, N, node_dim) — FP 맥락이 반영된 원자 행렬
+        """
+        Q = self.W_q(node_mat)               # (B, N, node_dim)
+        K = self.W_k(fp_vec).unsqueeze(1)    # (B, 1, node_dim)  — 단일 FP 토큰
+        V = self.W_v(fp_vec).unsqueeze(1)    # (B, 1, node_dim)
+
+        # 내적 스코어: 각 원자_i와 FP의 유사도
+        score = (Q * K).sum(dim=-1, keepdim=True) / self.scale  # (B, N, 1)
+        gate  = torch.sigmoid(score)                             # (B, N, 1) ∈ (0,1)
+
+        # 패딩 원자 게이트 제로화 (마스킹)
+        gate  = gate * mask.unsqueeze(-1).float()                # (B, N, 1)
+
+        # 각 원자가 FP 정보를 게이트 비율만큼 흡수
+        update = self.drop(gate * V)                             # (B, N, node_dim)
+
+        return self.norm(node_mat + update)                      # Residual + Norm
+
 
 # ─────────────────────────────────────────────────────────────
 # 1. Linear Projection Block (FP-Sub간 차원 통일)

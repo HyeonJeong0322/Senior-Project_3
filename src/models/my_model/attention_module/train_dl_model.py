@@ -77,19 +77,19 @@ def gcn_collate_fn(batch):
 # ─────────────────────────────────────────────────────────────
 
 class EarlyStopping:
-    """Val Loss 기반 Early Stopping. Best weight 자동 복원."""
+    """Val AUC 기반 Early Stopping (최대화). Best weight 자동 복원."""
     def __init__(self, patience: int = config.PATIENCE,
                  save_path: str = config.MODEL_WEIGHTS_PATH):
-        self.patience   = patience
-        self.save_path  = save_path
-        self.best_loss  = np.inf
-        self.counter    = 0
-        self.early_stop = False
+        self.patience    = patience
+        self.save_path   = save_path
+        self.best_score  = -np.inf
+        self.counter     = 0
+        self.early_stop  = False
 
-    def step(self, val_loss: float, model: nn.Module):
-        if val_loss < self.best_loss:
-            self.best_loss = val_loss
-            self.counter   = 0
+    def step(self, val_score: float, model: nn.Module):
+        if val_score > self.best_score:
+            self.best_score = val_score
+            self.counter    = 0
             torch.save(model.state_dict(), self.save_path)
             return True
         else:
@@ -224,29 +224,30 @@ def main():
 
     print(f"  Hold-out 분할 완료 -> Train/Val: {len(y_tv)}건 | Test: {len(y_test)}건\n")
 
+    # 2. RF 기반 Feature Selection — K-Fold 외부에서 1회만 수행 (Data Leakage 방지)
+    # Fold마다 다른 index를 선택하면 각 Fold 모델의 입력 공간이 달라져 앙상블 비교 불가
+    print("  [RF] Training Random Forest for Feature Selection (1회 고정)...")
+    rf = RandomForestClassifier(n_estimators=100, random_state=config.RANDOM_SEED, n_jobs=-1)
+    rf.fit(fp_tv, y_tv)
+    top_k_idx   = np.argsort(rf.feature_importances_)[::-1][:config.FP_SELECT_DIM]
+    fp_tv_sel   = fp_tv[:,   top_k_idx]
+    fp_test_sel = fp_test[:, top_k_idx]
+    print(f"  [RF] FP dim reduced: {fp_tv.shape[1]} → {fp_tv_sel.shape[1]}\n")
+
     kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=config.RANDOM_SEED)
     fold_aucs = []
-
-    fold_models_info = []
+    train_embs_list = []
+    test_embs_list  = []
 
     for fold, (train_inner, val_inner) in enumerate(kf.split(np.zeros(len(y_tv)), y_tv), 1):
         print(f"\n{'='*20} Fold {fold}/5 {'='*20}")
 
-        # 2. Train / Val 분할
-        fp_train, fp_val = fp_tv[train_inner], fp_tv[val_inner]
+        # 3. Train / Val 분할 (RF 선택된 FP 사용)
+        fp_train_sel = fp_tv_sel[train_inner]
+        fp_val_sel   = fp_tv_sel[val_inner]
         y_train, y_val   = y_tv[train_inner], y_tv[val_inner]
         graphs_train = [graphs_tv[i] for i in train_inner]
         graphs_val   = [graphs_tv[i] for i in val_inner]
-
-        # 3. RF 기반 Feature Selection (FP 차원 축소)
-        print("  [RF] Training Random Forest for Feature Selection...")
-        rf = RandomForestClassifier(n_estimators=100, random_state=config.RANDOM_SEED, n_jobs=-1)
-        rf.fit(fp_train, y_train)
-        top_k_idx    = np.argsort(rf.feature_importances_)[::-1][:config.FP_SELECT_DIM]
-        
-        fp_train_sel = fp_train[:, top_k_idx]
-        fp_val_sel   = fp_val[:,   top_k_idx]
-        print(f"  [RF] FP dim reduced: {fp_train.shape[1]} → {fp_train_sel.shape[1]}")
 
         # 4. 데이터로더 생성 (GCN 그래프 배치 patching)
         train_ds = DILIGraphDataset(fp_train_sel, graphs_train, y_train)
@@ -257,8 +258,8 @@ def main():
         val_loader   = DataLoader(val_ds,  batch_size=config.BATCH_SIZE,
                                   shuffle=False, collate_fn=gcn_collate_fn)
 
-        # 5. 모델 생성
-        fp_dim = fp_train_sel.shape[1]
+        # 4. 모델 생성
+        fp_dim = fp_train_sel.shape[1]   # = config.FP_SELECT_DIM (128)
         model  = build_gcn_model(fp_dim, device)
 
         # 동적 pos_weight (클래스 불균형 보정)
@@ -296,7 +297,7 @@ def main():
             history["train_loss"].append(tr_loss); history["val_loss"].append(va_loss)
             history["train_auc"].append(tr_auc);   history["val_auc"].append(va_auc)
 
-            improved = early_stopping.step(va_loss, model)
+            improved = early_stopping.step(va_auc, model)
             if va_auc > fold_best_val_auc:
                 fold_best_val_auc = va_auc
 
@@ -311,56 +312,33 @@ def main():
         print(f"  [Fold {fold} 완료] Best Val AUC: {fold_best_val_auc:.4f}")
         fold_aucs.append(fold_best_val_auc)
         plot_history(history, fold)
-        
-        # 앙상블 모델 정보 저장
-        fold_models_info.append({
-            'model_path': early_stopping.save_path,
-            'fp_dim': fp_dim,
-            'top_k_idx': top_k_idx
-        })
+
+        # 7. 임베딩 추출 — 모델이 메모리에 있는 지금 즉시 추출 (별도 루프/재로드 불필요)
+        print(f"  > Fold {fold} 모델로 임베딩 추출 중...")
+        best_model = build_gcn_model(fp_dim, device)
+        best_model.load_state_dict(
+            torch.load(early_stopping.save_path, map_location=device, weights_only=True)
+        )
+        train_embs_list.append(extract_embeddings_memory(best_model, fp_tv_sel,   graphs_tv,   device))
+        test_embs_list.append( extract_embeddings_memory(best_model, fp_test_sel, graphs_test, device))
+        del best_model  # 메모리 즉시 해제
 
     print("\n" + "="*50)
     print(f"[완료] K-Fold 학습 종료 (평균 AUC: {np.mean(fold_aucs):.4f} +/- {np.std(fold_aucs):.4f})")
 
-    # 7. 5-Fold 앙상블로 임베딩 추출 (Data Leakage 차단)
-    print(f"\n[임베딩 추출 - 5-Fold 앙상블 추출 모드]")
-    train_embs_list = []
-    test_embs_list = []
-
-    for fold_idx in range(5):
-        print(f"  > Fold {fold_idx + 1} 모델로 임베딩 추출 중...")
-        m_info = fold_models_info[fold_idx]
-        top_k_idx = m_info['top_k_idx']
-
-        # 개별 Fold의 모델 로드
-        best_model = build_gcn_model(m_info['fp_dim'], device)
-        best_model.load_state_dict(torch.load(m_info['model_path'], map_location=device, weights_only=True))
-
-        # 전체 Train/Val 및 Test에 대해 RF 인덱스 적용
-        fp_tv_sel   = fp_tv[:, top_k_idx]
-        fp_test_sel = fp_test[:, top_k_idx]
-
-        emb_train = extract_embeddings_memory(best_model, fp_tv_sel, graphs_tv, device)
-        emb_test  = extract_embeddings_memory(best_model, fp_test_sel, graphs_test, device)
-        
-        train_embs_list.append(emb_train)
-        test_embs_list.append(emb_test)
-
-    # 5개의 임베딩 배열(Array) 산술 평균
+    # 8. 5개의 임베딩 배열 산술 평균 → 최종 저장 (Person B 용도)
     ensemble_train_embs = np.mean(train_embs_list, axis=0)
-    ensemble_test_embs  = np.mean(test_embs_list, axis=0)
+    ensemble_test_embs  = np.mean(test_embs_list,  axis=0)
 
-    # 최종 저장 (Person B 용도)
     np.save(config.EMBEDDING_TRAIN_PATH, ensemble_train_embs)
-    np.save(config.LABEL_TRAIN_PATH, y_tv)
-
-    np.save(config.EMBEDDING_TEST_PATH, ensemble_test_embs)
-    np.save(config.LABEL_TEST_PATH, y_test)
+    np.save(config.LABEL_TRAIN_PATH,     y_tv)
+    np.save(config.EMBEDDING_TEST_PATH,  ensemble_test_embs)
+    np.save(config.LABEL_TEST_PATH,      y_test)
 
     print(f"\n[완료] 5-Fold 앙상블 기반 임베딩 추출 & 저장 완료.")
     print(f"   Train 임베딩 차원: {ensemble_train_embs.shape}  -> {config.EMBEDDING_TRAIN_PATH}")
     print(f"   Test  임베딩 차원: {ensemble_test_embs.shape}  -> {config.EMBEDDING_TEST_PATH}")
-    print(f"   (임베딩 차원 = PROJECT_DIM + Z_readout, Person B 연동 대기중)")
+    print(f"   (임베딩 차원 = 2 * PROJECT_DIM = 256-dim, Person B 연동 대기중)")
 
 
 if __name__ == "__main__":
