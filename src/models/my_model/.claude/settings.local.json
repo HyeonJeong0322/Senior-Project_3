@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python train_dl_model.py)",
+      "Bash(python \"C:\\\\Capston2026\\\\CAP2026_0325\\\\Differential_AttentionBlock\\\\train_dl_model.py\")",
+      "Bash(dir \"C:\\\\Capston2026\\\\CAP2026_0325\\\\outputs\\\\*.pt\")",
+      "Bash(dir \"C:\\\\Capston2026\\\\CAP2026_0325\\\\outputs\\\\*.npy\")"
+    ]
+  }
+}

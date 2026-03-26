@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>DILI 예측 모델 아키텍처 다이어그램</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0f1117;
+      color: #e0e0e0;
+      font-family: 'Segoe UI', 'Malgun Gothic', sans-serif;
+      padding: 40px 60px;
+    }
+    h1 {
+      text-align: center;
+      font-size: 1.6rem;
+      color: #7ec8e3;
+      margin-bottom: 6px;
+      letter-spacing: 0.04em;
+    }
+    .subtitle {
+      text-align: center;
+      color: #888;
+      font-size: 0.88rem;
+      margin-bottom: 36px;
+    }
+
+    /* ── 다이어그램 컨테이너 ── */
+    .diagram-wrap {
+      background: #161b27;
+      border: 1px solid #2a3050;
+      border-radius: 12px;
+      padding: 36px 24px;
+      overflow-x: auto;
+    }
+    .mermaid { min-width: 900px; }
+
+    /* ── 범례 ── */
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px 32px;
+      margin-top: 28px;
+      padding: 18px 24px;
+      background: #161b27;
+      border: 1px solid #2a3050;
+      border-radius: 10px;
+    }
+    .legend-title {
+      width: 100%;
+      font-size: 0.8rem;
+      color: #7ec8e3;
+      font-weight: 600;
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.82rem;
+      color: #ccc;
+    }
+    .legend-color {
+      width: 14px;
+      height: 14px;
+      border-radius: 3px;
+      flex-shrink: 0;
+    }
+
+    /* ── 하단 치수 테이블 ── */
+    .dim-table {
+      margin-top: 28px;
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.83rem;
+    }
+    .dim-table th {
+      background: #1e2540;
+      color: #7ec8e3;
+      padding: 9px 16px;
+      text-align: left;
+      font-weight: 600;
+      border-bottom: 2px solid #2a3050;
+    }
+    .dim-table td {
+      padding: 8px 16px;
+      border-bottom: 1px solid #1e2540;
+      color: #ccc;
+    }
+    .dim-table tr:hover td { background: #1a2035; }
+    .dim-table code {
+      background: #1e2540;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: 'Consolas', monospace;
+      font-size: 0.82rem;
+      color: #a8d8a8;
+    }
+  </style>
+</head>
+<body>
+
+<h1>DILIGCNModel — 전체 아키텍처 다이어그램</h1>
+<p class="subtitle">
+  Crossed Differential Attention &amp; 1-Layer GCN 기반 약물 유발성 간손상(DILI) 예측 모델
+  &nbsp;|&nbsp; CAP2026_0325
+</p>
+
+<div class="diagram-wrap">
+<div class="mermaid">
+%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background":       "#161b27",
+    "primaryColor":     "#1e2a45",
+    "primaryTextColor": "#e0e0e0",
+    "primaryBorderColor":"#3a4a70",
+    "lineColor":        "#4a6fa5",
+    "secondaryColor":   "#1a2535",
+    "tertiaryColor":    "#0f1520",
+    "edgeLabelBackground":"#1a2535",
+    "fontFamily":       "Segoe UI, Malgun Gothic, sans-serif"
+  }
+}}%%
+
+flowchart TD
+
+  %% ─────────── INPUT ───────────
+  IN(["📄 SMILES\n입력"]):::input
+
+  %% ─────────── PATH A: GLOBAL FP ───────────
+  subgraph PA["  PATH A — Global Fingerprint  "]
+    direction TB
+    MACCS["MACCS Keys\n167-dim"]:::feat
+    MORGAN["Morgan ECFP6\nradius=3 / 512-dim"]:::feat
+    CONCAT_FP["Concatenate\n679-dim"]:::op
+    RF["Random Forest\nFeature Selection\ntop-128"]:::rf
+    PROJ_FP["ProjectionBlock\nLinear → LayerNorm → ReLU → Dropout\n679→128-dim"]:::block
+    FP_VEC["fp_proj\n(B, 128)"]:::tensor
+    MACCS --> CONCAT_FP
+    MORGAN --> CONCAT_FP
+    CONCAT_FP --> RF
+    RF --> PROJ_FP
+    PROJ_FP --> FP_VEC
+  end
+
+  %% ─────────── PATH B: LOCAL GCN ───────────
+  subgraph PB["  PATH B — Local GCN (Topology Encoder)  "]
+    direction TB
+    ATOMS["원자 피처 추출\natom_features()\n25-dim per atom"]:::feat
+    ADJ["인접 행렬 구성\nself-loop 포함\n(N×N)"]:::feat
+    PAD["패딩 &amp; 마스킹\n(B, max_N, 25)\n(B, max_N, max_N)\nmask (B, max_N)"]:::op
+
+    subgraph GCN["  OneLayerGCN (1-hop Message Passing)  "]
+      direction TB
+      GCN_W["Linear W\n25 → 128"]:::block
+      GCN_NORM["D⁻¹ · A · H · W\n차수 정규화 집계"]:::op
+      GCN_ACT["LayerNorm → ReLU → Dropout\n마스크 제로화"]:::block
+    end
+
+    NODE_MAT["node_mat\n(B, max_N, 128)"]:::tensor
+    ATOMS --> PAD
+    ADJ   --> PAD
+    PAD   --> GCN_W
+    GCN_W --> GCN_NORM
+    GCN_NORM --> GCN_ACT
+    GCN_ACT --> NODE_MAT
+  end
+
+  %% ─────────── GRAPH ATTENTION READOUT ───────────
+  subgraph GAR["  GraphAttentionReadout — Differential Attention  "]
+    direction TB
+
+    subgraph QUERIES["  Differential Query 투영  "]
+      Q1["W_q1 → q1\n(B, 1, 128)"]:::attn
+      Q2["W_q2 → q2\n(B, 1, 128)"]:::attn
+    end
+
+    KV["W_k → k  /  W_v → v\n(B, N, 128)"]:::attn
+    PAD_MASK["패딩 마스크 적용\n(-1e9 → softmax 후 0)"]:::op
+
+    A1["A1 = softmax(q1·kᵀ / √d)\n(B, 1, N)"]:::attn
+    A2["A2 = softmax(q2·kᵀ / √d)\n(B, 1, N)"]:::attn
+
+    LAMBDA["λ = 0.8 + sigmoid(λ_logit)×0.2\n학습 가능 스칼라\n범위: 0.8 ~ 1.0"]:::lambda
+
+    ADIFF["A_diff = Dropout(A1 − λ·A2)\n노이즈 Attention 상쇄\nToxicophore 원자 증폭"]:::diff
+
+    READOUT["z = A_diff · v\nLayerNorm\nz_readout (B, 128)"]:::tensor
+  end
+
+  %% ─────────── FUSION ───────────
+  subgraph FUSE["  Feature Fusion  "]
+    direction TB
+    CONCAT["Concatenate\n[ fp_proj ‖ z_readout ]\n(B, 256)"]:::op
+  end
+
+  %% ─────────── OUTPUT PATHS ───────────
+  subgraph OUT["  출력 분기  "]
+    direction LR
+    MLP["Auxiliary MLP Head\n(학습 전용)\nLinear(256→128)\nLayerNorm → GELU → Dropout\nLinear(128→2)"]:::mlp
+    LOGITS["Logits (B, 2)\nCrossEntropyLoss\n역전파"]:::loss
+    EMB["final_embeddings.npy\n(N, 256)\n5-Fold 앙상블 평균"]:::emb
+  end
+
+  XGBOOST["Person B\nXGBoost Classifier"]:::xgb
+
+  %% ─────────── EDGES ───────────
+  IN --> PA
+  IN --> PB
+
+  FP_VEC  -->|"Query"| QUERIES
+  NODE_MAT -->|"Key / Value"| KV
+  KV --> PAD_MASK
+  PAD_MASK --> A1
+  PAD_MASK --> A2
+  LAMBDA --> ADIFF
+  A1 --> ADIFF
+  A2 --> ADIFF
+  ADIFF --> READOUT
+
+  FP_VEC   --> CONCAT
+  READOUT  --> CONCAT
+
+  CONCAT -->|"return_embedding=False\n학습 시"| MLP
+  MLP --> LOGITS
+  CONCAT -->|"return_embedding=True\n추론 시"| EMB
+  EMB --> XGBOOST
+
+  %% ─────────── STYLES ───────────
+  classDef input    fill:#1a3a5c,stroke:#4a9ad4,color:#cce8ff,font-weight:600
+  classDef feat     fill:#1a3a2a,stroke:#4aad74,color:#ccffcc
+  classDef block    fill:#1e2a45,stroke:#3a5a9a,color:#aac4ee
+  classDef op       fill:#2a1e3a,stroke:#6a4a9a,color:#d0b8ee
+  classDef rf       fill:#2a2a1e,stroke:#9a9a4a,color:#eeeeaa
+  classDef attn     fill:#2a1e2a,stroke:#9a4a9a,color:#eec0ee
+  classDef lambda   fill:#3a1e1e,stroke:#aa4a4a,color:#ffc8c8,font-weight:600
+  classDef diff     fill:#3a2a1e,stroke:#aa7a4a,color:#ffdab8,font-weight:600
+  classDef tensor   fill:#1e3a3a,stroke:#4aaa9a,color:#aaffee,font-weight:600
+  classDef mlp      fill:#1e2a1e,stroke:#5a8a5a,color:#b8eeb8
+  classDef loss     fill:#3a1e1e,stroke:#aa4a4a,color:#ffb8b8
+  classDef emb      fill:#1e3a1e,stroke:#5aaa5a,color:#aaffaa,font-weight:700
+  classDef xgb      fill:#3a3a1e,stroke:#aaaa4a,color:#ffffaa,font-weight:700
+
+</div>
+</div>
+
+<!-- 범례 -->
+<div class="legend">
+  <span class="legend-title">범례</span>
+  <span class="legend-item"><span class="legend-color" style="background:#1a3a5c;border:1px solid #4a9ad4"></span> 입력</span>
+  <span class="legend-item"><span class="legend-color" style="background:#1a3a2a;border:1px solid #4aad74"></span> Feature 추출</span>
+  <span class="legend-item"><span class="legend-color" style="background:#1e2a45;border:1px solid #3a5a9a"></span> 학습 블록 (Linear/Norm/Activation)</span>
+  <span class="legend-item"><span class="legend-color" style="background:#2a1e3a;border:1px solid #6a4a9a"></span> 연산 (Concat / Padding / Masking)</span>
+  <span class="legend-item"><span class="legend-color" style="background:#2a2a1e;border:1px solid #9a9a4a"></span> RF Feature Selection</span>
+  <span class="legend-item"><span class="legend-color" style="background:#2a1e2a;border:1px solid #9a4a9a"></span> Attention 연산</span>
+  <span class="legend-item"><span class="legend-color" style="background:#3a1e1e;border:1px solid #aa4a4a"></span> Lambda (학습 가능 파라미터)</span>
+  <span class="legend-item"><span class="legend-color" style="background:#3a2a1e;border:1px solid #aa7a4a"></span> Differential Attention (핵심)</span>
+  <span class="legend-item"><span class="legend-color" style="background:#1e3a3a;border:1px solid #4aaa9a"></span> Tensor (중간 출력)</span>
+  <span class="legend-item"><span class="legend-color" style="background:#1e3a1e;border:1px solid #5aaa5a"></span> 최종 임베딩 출력</span>
+  <span class="legend-item"><span class="legend-color" style="background:#3a3a1e;border:1px solid #aaaa4a"></span> Person B (XGBoost)</span>
+</div>
+
+<!-- 치수 요약 테이블 -->
+<table class="dim-table" style="margin-top:28px">
+  <thead>
+    <tr>
+      <th>레이어 / 구성요소</th>
+      <th>입력 차원</th>
+      <th>출력 차원</th>
+      <th>config 파라미터</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr><td>MACCS Keys</td><td>SMILES</td><td>(B, 167)</td><td>—</td></tr>
+    <tr><td>Morgan ECFP6</td><td>SMILES</td><td>(B, 512)</td><td><code>MORGAN_DIM=512, MORGAN_RADIUS=3</code></td></tr>
+    <tr><td>Global FP Concatenate</td><td>(B, 167) + (B, 512)</td><td>(B, 679)</td><td>—</td></tr>
+    <tr><td>RF Feature Selection</td><td>(B, 679)</td><td>(B, 128)</td><td><code>FP_SELECT_DIM=128</code></td></tr>
+    <tr><td>ProjectionBlock</td><td>(B, 128)</td><td>(B, 128)</td><td><code>PROJECT_DIM=128</code></td></tr>
+    <tr><td>atom_features()</td><td>RDKit Atom</td><td>(N, 25)</td><td><code>GCN_NODE_FEAT_DIM=25</code></td></tr>
+    <tr><td>OneLayerGCN (Linear W)</td><td>(B, N, 25)</td><td>(B, N, 128)</td><td><code>GCN_OUT_DIM=128</code></td></tr>
+    <tr><td>GraphAttentionReadout q1, q2</td><td>(B, 128)</td><td>(B, 1, 128)</td><td><code>PROJECT_DIM=128</code></td></tr>
+    <tr><td>GraphAttentionReadout k, v</td><td>(B, N, 128)</td><td>(B, N, 128)</td><td>—</td></tr>
+    <tr><td>λ (lambda_logit)</td><td>scalar</td><td>0.8 ~ 1.0</td><td>학습 가능 파라미터</td></tr>
+    <tr><td>A_diff = A1 − λ·A2</td><td>(B, 1, N)</td><td>(B, 1, N)</td><td><code>ATTN_DROPOUT=0.2</code></td></tr>
+    <tr><td>z_readout = A_diff · v</td><td>(B, 1, N) × (B, N, 128)</td><td>(B, 128)</td><td>—</td></tr>
+    <tr><td>Fusion Concat</td><td>(B, 128) + (B, 128)</td><td>(B, 256)</td><td><code>PROJECT_DIM × 2</code></td></tr>
+    <tr><td>MLPClassifier fc1 (학습 전용)</td><td>(B, 256)</td><td>(B, 128)</td><td><code>MLP_HIDDEN_DIM=128</code></td></tr>
+    <tr><td>MLPClassifier fc2 (학습 전용)</td><td>(B, 128)</td><td>(B, 2)</td><td><code>NUM_CLASSES=2</code></td></tr>
+    <tr><td><strong>final_embeddings.npy</strong></td><td>—</td><td><strong>(N, 256)</strong></td><td>5-Fold 앙상블 평균</td></tr>
+  </tbody>
+</table>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    flowchart: { curve: 'basis', padding: 20 }
+  });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Crossed Differential Attention 알고리즘 분석 (DILI 예측)</title>
+    <style>
+        body { 
+            font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif; 
+            line-height: 1.6; 
+            margin: 40px auto; 
+            max-width: 900px; 
+            padding: 0 40px; 
+            color: #333; 
+        }
+        h1 { color: #2c3e50; text-align: center; border-bottom: 2px solid #3498db; padding-bottom: 15px; margin-bottom: 30px; }
+        h2 { color: #2980b9; border-bottom: 1px solid #e2e8f0; padding-bottom: 5px; margin-top: 40px; }
+        h3 { color: #34495e; margin-top: 25px; }
+        .mermaid { text-align: center; margin: 30px 0; background: #fdfdfd; padding: 20px; border-radius: 8px; border: 1px solid #eaeaea; }
+        code { background: #f4f4f4; padding: 3px 6px; border-radius: 4px; font-family: 'Consolas', monospace; font-size: 0.9em; color: #c0392b; }
+        ul, ol { margin-left: 20px; }
+        li { margin-bottom: 10px; }
+        p { text-align: justify; word-break: keep-all; }
+        
+        @media print {
+            body { margin: 0; padding: 15mm; max-width: none; }
+            h1 { font-size: 24pt; border-bottom: 2px solid #000; color: #000; }
+            h2 { font-size: 18pt; border-bottom: 1px solid #ccc; color: #000; page-break-after: avoid; }
+            h3 { font-size: 14pt; color: #000; page-break-after: avoid; }
+            .mermaid { page-break-inside: avoid; border: 1px solid #ccc; }
+            p, li { font-size: 11pt; color: #000; }
+            @page { size: A4; margin: 10mm; }
+        }
+    </style>
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+        // Trigger print dialog after a slight delay to ensure mermaid renders completely
+        setTimeout(() => { console.log('Mermaid render complete'); }, 1000);
+    </script>
+</head>
+<body>
+    <h1>Crossed Differential Attention 기반 DILI 예측 모델 분석</h1>
+
+    <h2>1. 모델의 목적 (Objective)</h2>
+    <p>본 알고리즘의 최종 목적은 <strong>"약물 유발성 간손상(Drug-Induced Liver Injury, DILI) 예측의 정확도와 강건성을 극대화하기 위한 이종 분자 특징(Heterogeneous Molecular Features) 간의 상호 설명적 융합(Cross-Explanatory Fusion)"</strong>입니다.</p>
+    <p>일반적인 딥러닝 모델이 전체 구조 위주의 지문(Fingerprint) 단일 특징만을 쓰거나 단순히 결합(Concatenation)하는 방식을 취하는 반면, 본 알고리즘은 분자의 <strong>전역적 특징(FP)</strong>과 <strong>국소적 특징(Sub)</strong>을 독립된 입력으로 활용합니다. 핵심 목적은 서로 형태가 다른 이종 특징이 서로 부족한 정보를 교차 참조(Cross-Reference)하게 하고, Differential Attention 메커니즘을 통해 불필요한 노이즈 연관성을 상쇄시켜 모델이 간 독성과 직결된 식별 패턴에 온전히 집중하도록 만드는 데에 있습니다.</p>
+
+    <h2>2. 전체 아키텍처 및 상세 세부 사항 (Architecture)</h2>
+    
+    <h3>아키텍처 다이어그램 (Flowchart)</h3>
+    <div class="mermaid">
+    graph TD
+        in_FP["Global Features (FP)<br/>MACCS + ECFP6 (1191-dim)"] --> proj_FP["Linear Projection<br/>(256-dim)"]
+        in_Sub["Local Features (Sub)<br/>Substructure Vocab (max 512-dim)"] --> proj_Sub["Linear Projection<br/>(256-dim)"]
+
+        proj_FP --> stack1
+        proj_Sub --> stack1
+
+        subgraph "Crossed Differential Attention Block (3-Stacks)"
+            direction TB
+            stack1["Stack 1"] --> stack2["Stack 2"]
+            stack2["Stack 3"]
+            
+            subgraph "Single Layer (Crossed Reference)"
+                direction LR
+                Q_FP["Query = FP"] 
+                KV_Sub["Key/Value = Sub"]
+                DiffAttn1["DiffAttention<br/>(A1 - λA2)"]
+                
+                Q_Sub["Query = Sub"]
+                KV_FP["Key/Value = FP"]
+                DiffAttn2["DiffAttention<br/>(A1 - λA2)"]
+
+                Q_FP & KV_Sub --> DiffAttn1
+                Q_Sub & KV_FP --> DiffAttn2
+            end
+        end
+
+        stack2 --> fuse["Feature Fusion<br/>Concatenate (FP_final || Sub_final)"]
+        fuse --> rep["Deep Representation (512-dim)"]
+        
+        rep --> MLP["MLP Classifier"]
+        MLP --> out["DILI Prediction (Binary)"]
+        rep -.-> save["Save to .npy for downstream Hybrid/XAI tasks"]
+
+        classDef input fill:#f4f4f4,stroke:#333,stroke-width:1px;
+        classDef module fill:#e1f5fe,stroke:#039be5,stroke-width:2px;
+        classDef output fill:#e8f5e9,stroke:#43a047,stroke-width:2px;
+        class in_FP,in_Sub input;
+        class proj_FP,proj_Sub,stack1,stack2,fuse,MLP module;
+        class out,save output;
+    </div>
+
+    <h3>1) Feature Representation & Linear Projection</h3>
+    <p>분자 전체 위상과 성질을 포함하는 FP(1191차원)와 특성 부분 구조 빈도수를 모델링하는 Sub(최대 512차원)를 <code>ProjectionBlock</code>으로 정규화(LayerNorm) 및 Dropout과 함께 동일 잠재 공간(256차원)으로 투영합니다. 이는 두 표현 벡터 간의 크기 편차에 의한 불균형을 방지합니다.</p>
+
+    <h3>2) Crossed Differential Attention</h3>
+    <ul>
+        <li><strong>교차 참조 (Cross-Reference):</strong> Pass 1에서는 FP가 Query, Sub가 Key/Value가 되어 전역 정보 관점에서 중요한 부분 구조를 탐색합니다. Pass 2에서는 반대로 진행되어 양방향 정보를 추론합니다.</li>
+        <li><strong>Differential Attention:</strong> 각 Head를 절반으로 쪼개어 독립적인 어텐션 분포 A1, A2를 구하고, 이를 <code>(A1 - λA2)</code>로 계산해 배경 노이즈를 상쇄합니다. (Ye et al. 논문 기반)</li>
+    </ul>
+
+    <h3>3) 3-Stack Multi-Layer 반복</h3>
+    <p>위의 교차 참조 과정을 총 3회 반복하여, 잔차 연결(Residual Connection)과 함께 점점 더 정교한 상호 보완적 임베딩 맵을 스스로 구축합니다.</p>
+
+    <h2>3. 파라미터(Weights)의 역할</h2>
+    <ul>
+        <li><strong>람다(λ) 파라미터:</strong> A2 즉, "노이즈를 포함한 백그라운드 어텐션"을 얼마나 뺄 것인지 동적으로 조절하는 학습 가능한 가중치입니다. 데이터에 따라 의미 있는 신호와 수많은 분자의 잡음 트리를 스스로 평가·분리해냅니다.</li>
+        <li><strong>어텐션 프로젝션 가중치 (Wq, Wk, Wv, Wo):</strong> 전역적 특성과 국소적 특성이라는 서로 다른 의미를 가진 고차원 피처 공간을 연결하는 "통역 기제" 역할을 하여 Cross-Attention 연산이 작동하게 하는 뇌관 역할을 합니다.</li>
+    </ul>
+
+    <h2>4. 학습 방법론 (Learning Strategy)</h2>
+    <ul>
+        <li><strong>Objective Function:</strong> 최종 MLP 분류기에 CrossEntropy Loss를 사용하여 앞단의 특징 융합 모듈까지 역전파(Backpropagation)하는 End-to-End 학습을 수행합니다.</li>
+        <li><strong>Label Smoothing:</strong> 스무딩(0.1) 기법을 도입하여 하드 라벨에 의한 소규모 화학/의료 데이터의 과적합(Overconfidence) 및 치우침 현상을 완화했습니다.</li>
+        <li><strong>동적 패널티 할당 (pos_weight):</strong> DILI 데이터 특성상 발생하는 극심한 클래스 불균형을 해결하기 위해 양성/음성 샘플 비율을 추정하여 Loss 함수의 페널티 가중치로 동적 할당하였습니다.</li>
+        <li><strong>최적화 및 스케줄링:</strong> AdamW 옵티마이저(L2 정규화 1e-3)와 Cosine Annealing Learning Rate를 사용해 안정적으로 전역 최소점(Global Minimum) 수렴을 유도하고 있습니다.</li>
+    </ul>
+
+    <h2>5. 평가지표 (Accuracies) 및 내용 설명</h2>
+    <p>본 훈련 스크립트는 단순 Validation Accuracy가 아닌 <strong>Loss와 ROC-AUC</strong>를 핵심 지표로 계산하고 모니터링합니다.</p>
+    <ul>
+        <li>DILI(약물 유발 간손상) 예측은 유독한 약물을 정상으로 판별하는 "False Negative"가 치명적인 도메인이기 때문에 불균형 분포에서 모델의 변별 능력을 직관적으로 평가할 수 있는 <strong>ROC-AUC (Receiver Operating Characteristic Area Under Curve)</strong>를 1차 기준으로 씁니다.</li>
+        <li>또한 Early Stopping 조건에서도 모델의 갱신 조건을 단순 일치율(Accuracy)이 아닌 실질 변별력의 개선(val_auc 향상) 여부로 측정해 편향된 모델링을 방지합니다.</li>
+    </ul>
+
+    <h2>6. 도출된 개선점 제안 (Proposals for Improvement)</h2>
+    <ol>
+        <li><strong>Feature Redundancy 제어 및 차원 축소 추가:</strong> 현재 FP에서 MACCS(167-dim)와 ECFP6(1024-dim)를 단순히 이어 붙임(Concat)으로써 1191 차원을 만들며 방대한 규모의 희소성(Sparsity) 노이즈가 유입될 위험이 있습니다. 트리 기반 Feature Selection이나 사전 PCA 차원 압축 레이어를 모델 맨 앞에 도입할 것을 제안합니다.</li>
+        <li><strong>Focal Loss의 적용:</strong> 클래스 불균형 해결을 위해 단순 배수 보정(pos_weight)만 주는 대신, "잘 맞추는 백그라운드 샘플"의 영향을 억제시키고 "자꾸 틀리는 독성 분자(Hard Example)" 오류값의 가중치를 제곱 증폭시키는 Focal Loss 도입 시, 모델 AUC 성능이 크게 상승할 여력이 있습니다.</li>
+        <li><strong>Local Feature (Sub)를 위한 GNN 인코딩:</strong> 부분구조 Vocabulary에 대해 단순 룩업과 이산 빈도수 카운팅(Bag-of-Words 패턴)을 사용하고 있으나, 이는 부분 구조 간의 '연결 위상(Topology)'을 완전히 잃은 1차원 정보입니다. 향후 해당 부분을 1-Layer GCN(Graph Convolutional Network) 기반 서브 인코더로 교체하면 훨씬 강력하고 유효한 시너지가 발생할 것입니다.</li>
+    </ol>
+</body>
+</html>
