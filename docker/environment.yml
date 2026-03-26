@@ -17,3 +17,5 @@ dependencies:
       - torch-geometric
   - xgboost
   - jupyter
+  - lightgbm
+  - matplotlib
