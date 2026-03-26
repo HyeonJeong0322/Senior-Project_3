@@ -80,7 +80,8 @@ MLP_HIDDEN_DIM = 128         # 64 → 128 (분류기 표현력 향상)
 NUM_CLASSES    = 2           # binary: 0(non-DILI) / 1(DILI)
 
 # Feature Selection
-FP_SELECT_DIM = 128          # Random Forest로 선택할 최종 상위 FP 특징 수
+FP_VARIANCE_THRESHOLD = 0.01 # 1단계 VT: 분산 < 0.01 비트 제거 (전체의 1% 미만/99% 초과 등장)
+FP_SELECT_DIM         = 128  # 2단계 RF: VT 통과 비트 중 상위 K개 최종 선택
 
 # ─────────────────────────────────────────────
 # 7. GCN 로컬 인코더 하이퍼파라미터

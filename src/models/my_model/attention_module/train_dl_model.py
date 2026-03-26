@@ -24,6 +24,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import VarianceThreshold
 
 import config
 from data_preprocessing import (
@@ -224,15 +225,24 @@ def main():
 
     print(f"  Hold-out 분할 완료 -> Train/Val: {len(y_tv)}건 | Test: {len(y_test)}건\n")
 
-    # 2. RF 기반 Feature Selection — K-Fold 외부에서 1회만 수행 (Data Leakage 방지)
+    # 2. Feature Selection — K-Fold 외부에서 1회만 수행 (Data Leakage 방지)
     # Fold마다 다른 index를 선택하면 각 Fold 모델의 입력 공간이 달라져 앙상블 비교 불가
+
+    # 1단계: Variance Threshold — 희소/편재 비트 제거 (fp_tv 기준 fit, fp_test는 transform만)
+    print("  [VT] Removing low-variance FP bits...")
+    vt = VarianceThreshold(threshold=config.FP_VARIANCE_THRESHOLD)
+    fp_tv_vt   = vt.fit_transform(fp_tv)
+    fp_test_vt = vt.transform(fp_test)
+    print(f"  [VT] FP dim: {fp_tv.shape[1]} → {fp_tv_vt.shape[1]} ({fp_tv.shape[1] - fp_tv_vt.shape[1]}개 희소 비트 제거)")
+
+    # 2단계: RF — 정제된 비트에서 상위 K개 선택
     print("  [RF] Training Random Forest for Feature Selection (1회 고정)...")
     rf = RandomForestClassifier(n_estimators=100, random_state=config.RANDOM_SEED, n_jobs=-1)
-    rf.fit(fp_tv, y_tv)
+    rf.fit(fp_tv_vt, y_tv)
     top_k_idx   = np.argsort(rf.feature_importances_)[::-1][:config.FP_SELECT_DIM]
-    fp_tv_sel   = fp_tv[:,   top_k_idx]
-    fp_test_sel = fp_test[:, top_k_idx]
-    print(f"  [RF] FP dim reduced: {fp_tv.shape[1]} → {fp_tv_sel.shape[1]}\n")
+    fp_tv_sel   = fp_tv_vt[:, top_k_idx]
+    fp_test_sel = fp_test_vt[:, top_k_idx]
+    print(f"  [RF] FP dim: {fp_tv_vt.shape[1]} → {fp_tv_sel.shape[1]}\n")
 
     kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=config.RANDOM_SEED)
     fold_aucs = []
