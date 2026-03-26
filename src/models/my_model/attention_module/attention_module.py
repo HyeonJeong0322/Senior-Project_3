@@ -4,13 +4,19 @@ attention_module.py  (Person A — Step 2 핵심 모듈)
 Crossed Differential Attention Layer 및 3-Stack 블록 구현
 
   ① Linear Projection: 서로 다른 차원의 FP/Sub 벡터 → PROJECT_DIM 통일
-  ② Crossed Diff Attention:
+  ② [NEW] 1-Layer GCN Local Encoder:
+       SMILES 그래프(원자 노드 + 결합 엣지)를 위상(Topology) 손실 없이 인코딩.
+       Oversmoothing 방지를 위해 딱 1번의 Message Passing만 수행.
+  ③ [NEW] Graph Attention Readout:
+       GCN Node 행렬(N개 원자)을 Differential Attention 스코어로 가중합하여
+       단일 분자 표현 벡터로 압축. 노이즈 원자는 자동 상쇄(near-zero weight).
+  ④ Crossed Diff Attention:
        Pass 1 : Q=FP,  K/V=Sub  →  FP가 주목하는 Substructure 탐색
        Pass 2 : Q=Sub, K/V=FP   →  Sub가 주목하는 전역 문맥 파악
-  ③ Differential Attention (Microsoft 2024):
+  ⑤ Differential Attention (Microsoft 2024):
        두 개의 독립적인 Softmax Attention 값의 차(diff)를 활용하여
        관련 없는 Noise Attention을 상쇄시키고 신호 집중도를 높임
-  ④ NUM_STACKS회 반복으로 정보 밀도를 점진적으로 증가
+  ⑥ NUM_STACKS회 반복으로 정보 밀도를 점진적으로 증가
 
 참고 논문: Ye et al. "Differential Transformer", arXiv:2410.05258 (2024)
 """
@@ -20,7 +26,172 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from . import config
+import config
+
+
+# ─────────────────────────────────────────────────────────────
+# [NEW] 0. 원자 피처 추출 유틸리티 (data_preprocessing와 연동)
+# ─────────────────────────────────────────────────────────────
+
+# RDKit 원자 번호 → 허용 목록 (DILI 관련 주요 원소 44종)
+_ALLOWED_ATOMS = [
+    6, 7, 8, 9, 15, 16, 17, 35, 53,   # C,N,O,F,P,S,Cl,Br,I
+    5, 14, 34, 52,                      # B,Si,Se,Te
+    11, 12, 19, 20, 26, 29, 30, 33,    # Na,Mg,K,Ca,Fe,Cu,Zn,As
+]
+_ATOM_SET     = {a: i for i, a in enumerate(_ALLOWED_ATOMS)}
+_ATOM_OHE_DIM = len(_ALLOWED_ATOMS) + 1   # +1 for 'other'
+# 총 차원: 22 (OHE) + 1 (형식전하) + 1 (방향족) + 1 (수소 수) = 25 = GCN_NODE_FEAT_DIM
+
+
+def atom_features(atom) -> list:
+    """
+    단일 RDKit Atom → 피처 벡터 리스트 (GCN_NODE_FEAT_DIM = 25 차원)
+    구성: 원자번호 OHE (22) + 형식전하 (1) + 방향족 여부 (1) + 수소 수 (1)
+    """
+    anum = atom.GetAtomicNum()
+    ohe  = [0.0] * _ATOM_OHE_DIM
+    idx  = _ATOM_SET.get(anum, len(_ALLOWED_ATOMS))  # 미등록 → 마지막 칸
+    ohe[idx] = 1.0
+
+    return ohe + [
+        float(atom.GetFormalCharge()),
+        float(atom.GetIsAromatic()),
+        float(atom.GetTotalNumHs()),
+    ]
+
+
+# ─────────────────────────────────────────────────────────────
+# [NEW] 1-Layer GCN Local Encoder
+# ─────────────────────────────────────────────────────────────
+
+class OneLayerGCN(nn.Module):
+    """
+    위상(Topology) 보존 1-Layer Graph Convolutional Network.
+
+    - 순수 PyTorch 구현 (외부 패키지 없음):
+      배치 내 분자마다 원자 수가 다르므로, 최대 원자 수(max_atoms)로
+      패딩된 [B, max_atoms, feat_dim] 텐서와
+      마스킹된 인접 행렬 [B, max_atoms, max_atoms]을 입력받음.
+
+    - Message Passing (1-hop, 단 1번):
+        H_out = ReLU(LayerNorm( D^{-1} * A_self * H_in * W ))
+        A_self: self-loop 포함 인접 행렬, D: 차수 정규화 행렬
+
+    Oversmoothing을 방지하기 위해 레이어를 1개(1-hop)로 제한.
+    DILI 독성기(Toxicophore)는 반경 1 이웃 내 국소 구조로 발현되므로
+    1-hop 수렴이 최적의 정보 밀도를 제공함.
+    """
+    def __init__(self,
+                 in_dim:  int   = config.GCN_NODE_FEAT_DIM,
+                 out_dim: int   = config.GCN_OUT_DIM,
+                 dropout: float = config.FF_DROPOUT):
+        super().__init__()
+        self.W    = nn.Linear(in_dim, out_dim, bias=False)
+        self.norm = nn.LayerNorm(out_dim)
+        self.drop = nn.Dropout(dropout)
+        self.act  = nn.ReLU(inplace=True)
+
+    def forward(self,
+                x:    torch.Tensor,
+                adj:  torch.Tensor,
+                mask: torch.Tensor) -> torch.Tensor:
+        """
+        x    : (B, max_atoms, in_dim)    — 패딩된 원자 피처 행렬
+        adj  : (B, max_atoms, max_atoms) — self-loop 포함 인접 행렬
+        mask : (B, max_atoms)            — 유효 원자 True, 패딩 False
+        return: (B, max_atoms, out_dim)
+        """
+        # 1. 선형 투영: (B, N, in) → (B, N, out)
+        h = self.W(x)
+        # 2. 차수 정규화: D^{-1} * A  (행별 합의 역수로 나눔)
+        degree = adj.sum(dim=-1, keepdim=True).clamp(min=1.0)   # (B, N, 1)
+        # 3. 1-hop Message Passing: (B, N, N) @ (B, N, out) → (B, N, out)
+        agg = torch.bmm(adj / degree, h)
+        # 4. 활성화 + 정규화
+        out = self.drop(self.act(self.norm(agg)))
+        # 5. 패딩 위치 제로 마스킹
+        out = out * mask.unsqueeze(-1).float()
+        return out   # (B, N, out_dim)
+
+
+# ─────────────────────────────────────────────────────────────
+# [NEW] Graph Attention Readout
+# ─────────────────────────────────────────────────────────────
+
+class GraphAttentionReadout(nn.Module):
+    """
+    GCN 노드 행렬(N개 원자)을 전역 FP를 Query로 삼아
+    Differential Attention 가중합으로 1개의 분자 벡터로 압축.
+
+    핵심 역할 (프로젝트 목적 직결):
+      - FP(Q): 전역적 독성 패턴 형태를 파악.
+      - GCN Node K,V: 각 원자의 위상/이웃 환경 정보 보유.
+      - A_diff = A1 - λ*A2: 독성 패턴과 무관한 원자는 near-zero로 상쇄,
+        독성 Toxicophore 원자에만 높은 가중치 집중.
+      - Z_readout = Σ(A_diff_i * V_i): 농축된 독성 시그널 벡터.
+        → Projection Block에 전달.
+    """
+    def __init__(self,
+                 query_dim: int   = config.PROJECT_DIM,
+                 node_dim:  int   = config.GCN_OUT_DIM,
+                 out_dim:   int   = config.PROJECT_DIM,
+                 dropout:   float = config.ATTN_DROPOUT):
+        super().__init__()
+        self.W_q1 = nn.Linear(query_dim, node_dim, bias=False)
+        self.W_q2 = nn.Linear(query_dim, node_dim, bias=False)
+        self.W_k  = nn.Linear(node_dim,  node_dim, bias=False)
+        self.W_v  = nn.Linear(node_dim,  out_dim,  bias=False)
+
+        self.scale = math.sqrt(node_dim)
+        self.drop  = nn.Dropout(dropout)
+        self.norm  = nn.LayerNorm(out_dim)
+
+        # 학습 가능한 λ: 0.8 베이스 + sigmoid 범위 보정 (안정적 학습)
+        self.lambda_init  = 0.8
+        self.lambda_logit = nn.Parameter(torch.zeros(1))
+
+    def forward(self,
+                fp_vec:   torch.Tensor,
+                node_mat: torch.Tensor,
+                mask:     torch.Tensor) -> torch.Tensor:
+        """
+        fp_vec   : (B, query_dim) — 투영된 FP 벡터 (Query 역할)
+        node_mat : (B, N, node_dim) — GCN 출력 노드 행렬 (Key, Value)
+        mask     : (B, N)            — 유효 원자 True, 패딩 False
+        return   : (B, out_dim)      — Readout된 단일 분자 표현 벡터
+        """
+        # ── Differential Query 투영 (두 갈래) ──
+        q1 = self.W_q1(fp_vec).unsqueeze(1)   # (B, 1, node_dim)
+        q2 = self.W_q2(fp_vec).unsqueeze(1)
+
+        # ── Key / Value 투영 ──
+        k = self.W_k(node_mat)                 # (B, N, node_dim)
+        v = self.W_v(node_mat)                 # (B, N, out_dim)
+
+        # ── 어텐션 스코어 계산 ──
+        s1 = (q1 @ k.transpose(-2, -1)) / self.scale   # (B, 1, N)
+        s2 = (q2 @ k.transpose(-2, -1)) / self.scale
+
+        # 패딩 원자 마스킹 (-inf → softmax 후 0)
+        pad_mask = (~mask).unsqueeze(1).float() * -1e9  # (B, 1, N)
+        s1 = s1 + pad_mask
+        s2 = s2 + pad_mask
+
+        A1 = F.softmax(s1, dim=-1)   # (B, 1, N)
+        A2 = F.softmax(s2, dim=-1)
+
+        # λ: 0.8 ~ 1.0 범위 안정 유지
+        lam = self.lambda_init + torch.sigmoid(self.lambda_logit) * 0.2
+
+        # Differential: 노이즈 어텐션 상쇄, 핵심 원자 신호 증폭
+        A_diff = self.drop(A1 - lam * A2)   # (B, 1, N)
+
+        # ── 가중합 Readout ──
+        z = (A_diff @ v).squeeze(1)   # (B, out_dim)
+        return self.norm(z)
+
+
 
 
 # ─────────────────────────────────────────────────────────────

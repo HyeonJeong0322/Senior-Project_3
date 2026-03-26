@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>DILIGCNModel 아키텍처 다이어그램</title>
+    <!-- Mermaid.js 라이브러리 로드 -->
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <style>
+        body { 
+            font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif; 
+            margin: 40px; 
+            background-color: #f8f9fa;
+        }
+        h2 {
+            text-align: center;
+            color: #2c3e50;
+            margin-bottom: 30px;
+        }
+        .mermaid-container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            max-width: 1000px;
+            margin: 0 auto;
+            text-align: center;
+        }
+        .instructions {
+            text-align: center;
+            margin-top: 20px;
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <h2>DILIGCNModel (1-Layer GCN + Differential Attention Readout) 전체 아키텍처</h2>
+    
+    <div class="mermaid-container">
+        <div class="mermaid">
+        graph TD
+            %% 스타일 정의
+            classDef input fill:#f1f2f6,stroke:#7bed9f,stroke-width:2px;
+            classDef global fill:#eccc68,stroke:#ffa502,stroke-width:2px;
+            classDef local fill:#70a1fc,stroke:#1e90ff,stroke-width:2px;
+            classDef attention fill:#ff7f50,stroke:#ff6348,stroke-width:2px;
+            classDef output fill:#2ed573,stroke:#2f3542,stroke-width:2px;
+            classDef external fill:#a4b0be,stroke:#2f3542,stroke-width:2px,stroke-dasharray: 5 5;
+
+            %% 1. 입력단
+            SMILES(["원시 데이터 (SMILES)"]):::input
+            
+            %% 2. 피처 추출 (Feature Decoupling)
+            SMILES --> FP["Global Features (MACCS + Morgan)<br/>(679차원)"]:::global
+            SMILES --> Graphs["Local Topology (분자 그래프)<br/>(노드 N개 원자 정보)"]:::local
+
+            %% 3. 인코더 
+            FP --> RF["Random Forest 피처 선택<br/>+ Linear Projection"]:::global
+            RF --> FP_Q["전역 컨텍스트 벡터 (Query)<br/>(128차원)"]:::global
+
+            Graphs --> GCN["1-Layer GCN<br/>(Oversmoothing 방지)"]:::local
+            GCN --> Node_KV["국소 결합 행렬 (Key, Value)<br/>(N x 128차원)"]:::local
+
+            %% 4. Differential Attention Readout
+            FP_Q --> DiffAttn{"Differential Attention Readout<br/>방향: Global → Local"}:::attention
+            Node_KV --> DiffAttn
+
+            DiffAttn --> |"Q1, K1 연산"| A1["Attention 1 (A1)"]:::attention
+            DiffAttn --> |"Q2, K2 연산"| A2["Attention 2 (A2)"]:::attention
+            
+            A1 --> Adiff["차등 연산 (Noise 상쇄)<br/>A_diff = A1 - λ × A2"]:::attention
+            A2 --> Adiff
+            
+            Adiff --> |"가중합 (Weighted Sum)"| Z_Readout["독성 핵심(Toxicophore) 벡터<br/>(128차원)"]:::attention
+
+            %% 5. Fusion 및 Output
+            FP_Q --> Concat(("[전역 + 국소] 병합<br/>Concatenation (256차원)")):::output
+            Z_Readout --> Concat
+            
+            Concat -.-> |"학습 시에만 사용"| AuxMLP["Auxiliary MLP Head<br/>(DILI 이진 분류 Loss 계산)"]:::output
+            Concat ==> |"임베딩 추출"| FinalEmb["최종 임베딩 행렬<br/>(final_embeddings.npy)"]:::output
+            
+            FinalEmb ==> XGBoost[["Person B 파이프라인<br/>(XGBoost 등 외부 학습기)"]]:::external
+        </div>
+    </div>
+    
+    <div class="instructions">
+        ※ 팁: 해당 다이어그램 구역에서 우클릭 후 <strong>"이미지로 저장(Save image as)"</strong>을 누르시면 논문에 첨부하기 좋은 투명/고화질 PNG 형태로 자동 다운로드 됩니다.
+    </div>
+
+    <script>
+        // DOM 로드 완료 후 다이어그램 렌더링
+        document.addEventListener('DOMContentLoaded', function() {
+            mermaid.initialize({
+                startOnLoad: true,
+                theme: 'default',
+                flowchart: {
+                    useMaxWidth: true,
+                    htmlLabels: true
+                }
+            });
+        });
+    </script>
+</body>
+</html>

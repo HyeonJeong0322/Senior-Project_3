@@ -2,11 +2,13 @@
 data_preprocessing.py  (Step 1 — 데이터 전처리 모듈)
 ============================================================
 DILIrank binary CSV → Global(MACCS+Morgan FP) + Local(BRICS Substructure) 벡터 추출
+[NEW] GCN을 위한 분자 그래프(원자 피처 + 인접 행렬) 추출 함수 추가
 
 ① SMILES 로드 및 유효성 검증
-② Path A (Global) : MACCS Keys(167) + Morgan ECFP6(1024) → 1191-dim
-③ Path B (Local)  : BRICS 분해 → Bag-of-Fragments OHE (vocab 기반)
-④ Train/Test Split 후 vocab 고정 (데이터 누수 방지)
+② Path A (Global) : MACCS Keys(167) + Morgan ECFP6(512) → 679-dim  ← RF 후 FP_SELECT_DIM 축소
+③ Path B (Local/BoF): BRICS 분해 → Bag-of-Fragments OHE (vocab 기반, 기존 호환 유지)
+④ Path C (Local/GCN): 분자 그래프 → 원자 피처 행렬 + 인접 행렬 (위상 보존)
+⑤ Train/Test Split 후 vocab 고정 (데이터 누수 방지)
 """
 
 import os
@@ -23,10 +25,9 @@ from rdkit.Chem import (
     rdFingerprintGenerator,
 )
 from rdkit.Chem.Scaffolds import MurckoScaffold
-from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-from . import config
+import config
 
 # Morgan Generator (Deprecation 경고 제거)
 _morgan_gen = rdFingerprintGenerator.GetMorganGenerator(
@@ -62,17 +63,17 @@ def smiles_to_mol(smiles: str):
 
 def mol_to_global_fp(mol) -> np.ndarray:
     """
-    분자 → Global Fingerprint 벡터 (1191-dim)
-    = MACCS Keys (167) ‖ Morgan ECFP6 (1024)
+    분자 → Global Fingerprint 벡터 (679-dim)
+    = MACCS Keys (167) ‖ Morgan ECFP6 (512)
     MorganGenerator 사용으로 Deprecation 경고 제거.
     """
     maccs  = np.array(MACCSkeys.GenMACCSKeys(mol), dtype=np.float32)   # (167,)
-    morgan = np.array(_morgan_gen.GetFingerprint(mol), dtype=np.float32) # (1024,)
-    return np.concatenate([maccs, morgan], axis=0)                       # (1191,)
+    morgan = np.array(_morgan_gen.GetFingerprint(mol), dtype=np.float32) # (512,)
+    return np.concatenate([maccs, morgan], axis=0)                       # (679,)
 
 
 # ─────────────────────────────────────────────────────────────
-# Path B : Local Substructure (BRICS + Bemis-Murcko)
+# Path B : Local Substructure (BRICS + Bemis-Murcko) [기존 유지]
 # ─────────────────────────────────────────────────────────────
 
 def _brics_with_timeout(mol, result_holder: list):
@@ -151,13 +152,82 @@ def fragments_to_vector(fragments: list[str], vocab: dict) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────
+# [NEW] Path C : GCN 그래프 데이터 추출
+# ─────────────────────────────────────────────────────────────
+
+def mol_to_graph(mol) -> tuple[np.ndarray, np.ndarray]:
+    """
+    RDKit Mol → (node_feats, adj_matrix) 반환.
+    위상(Topology)을 보존하며 1-Layer GCN 입력 형식으로 변환.
+
+    - node_feats : (N, GCN_NODE_FEAT_DIM) — 원자 피처 행렬 (N = 중원자 수)
+    - adj_matrix : (N, N) — self-loop 포함 대칭 인접 행렬
+
+    ※ attention_module.atom_features()와 반드시 동일한 피처 정의를 사용해야 함.
+    """
+    from attention_module import atom_features  # 순환참조 방지를 위해 지역 import
+
+    # 수소 추가 없이 중원자(Heavy Atom)만 대상
+    n = mol.GetNumHeavyAtoms()
+
+    # 원자 피처 행렬
+    feat_list = [atom_features(atom) for atom in mol.GetAtoms()]
+    node_feats = np.array(feat_list, dtype=np.float32)   # (N, 48)
+
+    # 인접 행렬 (self-loop 포함)
+    adj = np.eye(n, dtype=np.float32)   # self-loop
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        adj[i, j] = 1.0
+        adj[j, i] = 1.0   # 무방향 그래프
+
+    return node_feats, adj   # (N, feat_dim), (N, N)
+
+
+def collate_graph_batch(graph_list: list[tuple]) -> tuple:
+    """
+    서로 다른 원자 수(N_i)를 가진 그래프 목록을
+    최대 원자 수(max_N)로 패딩하여 단일 배치 텐서로 변환.
+
+    Args:
+        graph_list: list of (node_feats (N_i, F), adj (N_i, N_i)) tuples
+
+    Returns:
+        x    : (B, max_N, F)          — 패딩된 원자 피처 텐서
+        adj  : (B, max_N, max_N)      — 패딩된 인접 행렬
+        mask : (B, max_N) bool tensor — 유효 원자 True, 패딩 False
+    """
+    import torch
+    feat_dim = config.GCN_NODE_FEAT_DIM
+    max_n    = max(nf.shape[0] for nf, _ in graph_list)
+    B        = len(graph_list)
+
+    x_batch   = np.zeros((B, max_n, feat_dim), dtype=np.float32)
+    adj_batch = np.zeros((B, max_n, max_n),    dtype=np.float32)
+    mask      = np.zeros((B, max_n),           dtype=bool)
+
+    for i, (nf, ad) in enumerate(graph_list):
+        n = nf.shape[0]
+        x_batch[i, :n, :]   = nf
+        adj_batch[i, :n, :n] = ad
+        mask[i, :n]           = True
+
+    return (
+        torch.tensor(x_batch,   dtype=torch.float32),
+        torch.tensor(adj_batch, dtype=torch.float32),
+        torch.tensor(mask,      dtype=torch.bool),
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 # 메인 전처리 파이프라인
 # ─────────────────────────────────────────────────────────────
 
-def load_and_preprocess(data_path: str = config.DATA_PATH):
+def load_all_data(data_path: str = config.DATA_PATH):
     """
-    CSV 파일 로드 → 전처리 → Train/Test 분리 →
-    (fp_train, sub_train, y_train), (fp_test, sub_test, y_test), vocab 반환
+    CSV 파일 로드 → 전처리 →
+    전체 환자(Mols)에 대한 fp_all, frags_all, graphs_all, labels 반환.
+    K-Fold 교차 검증을 위해 Train/Test 분리 로직은 훈련 스크립트로 위임합니다.
     """
     print(f"[1/5] 데이터 로드: {data_path}")
     df = pd.read_csv(data_path)
@@ -173,51 +243,44 @@ def load_and_preprocess(data_path: str = config.DATA_PATH):
     df = df.dropna(subset=["mol"]).reset_index(drop=True)
     print(f"      유효 분자: {len(df)} / {before} ({before - len(df)}개 제거)")
 
-    labels  = df[config.LABEL_COL].values.astype(np.int64)
-    smiles  = df[config.SMILES_COL].values
+    # 출처(ref) 컬럼이 있으면 소스별 분포 출력
+    if "ref" in df.columns:
+        print("      [출처 분포]", dict(df["ref"].value_counts()))
 
-    # ── Train / Test Split (vocab 누수 방지를 위해 먼저 분리) ──
-    idx = np.arange(len(df))
-    tr_idx, te_idx = train_test_split(
-        idx,
-        test_size=config.TEST_SIZE,
-        random_state=config.RANDOM_SEED,
-        stratify=labels
-    )
+    labels   = df[config.LABEL_COL].values.astype(np.int64)
     mols_all = df["mol"].tolist()
 
     # ── Path A: Global Fingerprint ──
     print("[3/5] Global Fingerprint 추출 (MACCS + Morgan ECFP6)")
-    fp_all = np.stack([mol_to_global_fp(m) for m in mols_all])  # (N, 1191)
-    fp_train, fp_test = fp_all[tr_idx], fp_all[te_idx]
+    fp_all = np.stack([mol_to_global_fp(m) for m in mols_all])  # (N, 679)
 
-    # ── Path B: Local Substructure ──
-    print("[4/5] Local Substructure 추출 (BRICS + Bemis-Murcko) — 분자당 최대 3초")
-    frags_all = [
-        mol_to_fragments(m)
-        for m in tqdm(mols_all, desc="  Substructure", ncols=80, unit="mol")
+    # ── Path B: Local Substructure (BoF) ──
+    # [최적화] frags_all은 현재 GCN 파이프라인에서 사용하지 않으므로 생략.
+    # BRICS 분해는 분자당 최대 3초 소요 → 전체 실행 시간의 핵심 낭비 요인.
+    # 레거시 DILIAttentionModel 사용 시에는 아래 주석을 해제하고 반환값에 frags_all 추가.
+    # frags_all = [
+    #     mol_to_fragments(m)
+    #     for m in tqdm(mols_all, desc="  Substructure", ncols=80, unit="mol")
+    # ]
+
+    # ── Path C: GCN 그래프 데이터 ──
+    print("[4/4] GCN 그래프 추출 (원자 피처 + 인접 행렬, 위상 보존)")
+    graphs_all = [
+        mol_to_graph(m)
+        for m in tqdm(mols_all, desc="  Graph", ncols=80, unit="mol")
     ]
-    frags_train  = [frags_all[i] for i in tr_idx]
 
-    # Train 기반 Vocab 구축 (Test에는 동일 vocab 적용)
-    vocab = build_fragment_vocab(frags_train, max_vocab=config.SUB_VOCAB_INIT_DIM)
-    print(f"      Vocab 크기: {len(vocab)}")
+    print(f"[완료] 총 {len(df)}개 샘플")
+    print(f"      Global FP dim : {fp_all.shape[1]}")
+    print(f"      class 분포  0:{(labels==0).sum()}  1:{(labels==1).sum()}")
 
-    sub_all   = np.stack([fragments_to_vector(f, vocab) for f in frags_all])   # (N, vocab)
-    sub_train = sub_all[tr_idx]
-    sub_test  = sub_all[te_idx]
-
-    y_train, y_test = labels[tr_idx], labels[te_idx]
-
-    print(f"[5/5] 완료 | Train: {len(tr_idx)}개, Test: {len(te_idx)}개")
-    print(f"      Global FP dim : {fp_train.shape[1]}")
-    print(f"      Local Sub dim : {sub_train.shape[1]}")
-    print(f"      class 분포(train) — 0:{(y_train==0).sum()}  1:{(y_train==1).sum()}")
-
-    return (fp_train, sub_train, y_train), (fp_test, sub_test, y_test), vocab
+    return fp_all, graphs_all, labels
 
 
 if __name__ == "__main__":
-    (fp_tr, sub_tr, y_tr), (fp_te, sub_te, y_te), vocab = load_and_preprocess()
-    print("fp_train shape :", fp_tr.shape)
-    print("sub_train shape:", sub_tr.shape)
+    fp_all, graphs_all, labels = load_all_data()
+    print("fp_all shape :", fp_all.shape)
+    print("그래프 샘플 node_feats shape:", graphs_all[0][0].shape)
+    print("그래프 샘플 adj shape:", graphs_all[0][1].shape)
+
+

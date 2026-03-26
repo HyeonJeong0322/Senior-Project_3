@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Crossed Differential Attention 결과 분석 (최종)</title>
+    <style>
+        body { 
+            font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif; 
+            line-height: 1.6; 
+            margin: 40px auto; 
+            max-width: 900px; 
+            padding: 0 40px; 
+            color: #333; 
+        }
+        h1 { color: #2c3e50; text-align: center; border-bottom: 2px solid #3498db; padding-bottom: 15px; margin-bottom: 30px; line-height: 1.3; }
+        h2 { color: #2980b9; border-bottom: 1px solid #e2e8f0; padding-bottom: 5px; margin-top: 40px; }
+        h3 { color: #34495e; margin-top: 25px; }
+        .mermaid { text-align: center; margin: 30px 0; background: #fdfdfd; padding: 20px; border-radius: 8px; border: 1px solid #eaeaea; }
+        .figure { text-align: center; margin: 30px 0; }
+        .figure img { max-width: 95%; height: auto; border: 1px solid #ddd; border-radius: 6px; box-shadow: 0 3px 6px rgba(0,0,0,0.1); }
+        .figure caption { display: block; margin-top: 10px; font-size: 0.9em; color: #555; font-style: italic; }
+        code { background: #f4f4f4; padding: 3px 6px; border-radius: 4px; font-family: 'Consolas', monospace; font-size: 0.9em; color: #c0392b; }
+        ul, ol { margin-left: 20px; }
+        li { margin-bottom: 10px; }
+        p { text-align: justify; word-break: keep-all; }
+        
+        @media print {
+            body { margin: 0; padding: 15mm; max-width: none; background-color: white; }
+            h1 { font-size: 24pt; border-bottom: 2px solid #000; color: #000; }
+            h2 { font-size: 18pt; border-bottom: 1px solid #ccc; color: #000; page-break-after: avoid; }
+            h3 { font-size: 14pt; color: #000; page-break-after: avoid; }
+            .figure img { max-width: 100%; box-shadow: none; border: 1px solid #ccc; }
+            .figure { page-break-inside: avoid; }
+            .mermaid { page-break-inside: avoid; border: 1px solid #ccc; }
+            p, li { font-size: 11pt; color: #000; }
+            @page { size: A4; margin: 10mm; }
+        }
+    </style>
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+</head>
+<body>
+    <h1>Crossed Differential Attention 성능 분석 및 데이터 임베딩 시각화 보고서<br/>(최종)</h1>
+
+    <h2>1. 모델의 목적 (Objective)</h2>
+    <p>본 모델의 핵심 목표는 <strong>"약물 유발성 간손상(DILI) 예측 시 빈번한 노이즈 라벨에 과적합되지 않으면서, 의약·화학적 구조의 설명력(Interpretability)을 최대한 보존하는 글로벌-로컬 피처 간의 상호 교차 예측"</strong>입니다.</p>
+    <p>적은 제약 데이터 샘플 수(StackDILI 1,851개)를 보완하기 위해 모델 파라미터 다이어트(정규화 상향 개편)와 Random Forest 기반의 차원 마스킹 축소를 극한으로 구현했습니다. 더불어 GCN의 한계점인 이웃 노드 신호 희석(Oversmoothing) 현상을 통제하기 위해 단어 가방(Bag-of-Fragments) 전략과 어텐션을 활용하여 반응 작용기(Toxicophore)를 포착합니다.</p>
+
+    <h2>2. 전체 아키텍처 (Architecture)</h2>
+    
+    <h3>파이프라인 다이어그램</h3>
+    <div class="mermaid">
+    graph TD
+        %% Base Dataset
+        data["StackDILI Dataset<br/>(1851 Samples, Multi-Source)"] --> KF{"Stratified<br/>5-Fold CV"}
+        
+        KF -.-> |Loop per Fold| train["Train Split"]
+        KF -.-> |Loop per Fold| test["Test Split"]
+        
+        %% Feature Processing (Train Only Leakage Prevention)
+        train --> rf["Random Forest Feature Selection<br/>(Extract Top 256 Importances)"]
+        rf --> mask{"Feature Masking<br/>(1191 -> 256)"}
+        
+        train --> mask
+        test --> mask
+        mask --> fp_sel["FP Selected (256-dim)"]
+        
+        train --> vocab["Build Sub-Vocab<br/>(max 128-dim)"]
+        vocab --> sub_train["Sub Train (OHE)"]
+        test --> vocab
+        vocab --> sub_test["Sub Test (OHE)"]
+        
+        %% Linear Projection
+        fp_sel --> proj_FP["ProjectionBlock<br/>(64-dim)"]
+        sub_train & sub_test --> proj_Sub["ProjectionBlock<br/>(64-dim)"]
+
+        %% Attention
+        proj_FP --> stack["Crossed Differential<br/>Attention Block (1-Stack, 4-Heads)"]
+        proj_Sub --> stack
+        
+        %% Fused Output
+        stack --> fuse["Feature Fusion<br/>Concatenate (64 || 64)"]
+        fuse --> rep["Deep Representation (128-dim)"]
+        
+        %% Task Prediction
+        rep --> MLP["MLP Classifier (64-dim)"]
+        MLP --> out["DILI Prediction (Loss & AUC)"]
+        out -.-> es["Early Stopping<br/>(Val Loss monitoring)"]
+
+        classDef input fill:#f4f4f4,stroke:#333,stroke-width:1px;
+        classDef preprocessing fill:#fff3e0,stroke:#f57c00,stroke-width:2px;
+        classDef module fill:#e1f5fe,stroke:#039be5,stroke-width:2px;
+        classDef output fill:#e8f5e9,stroke:#43a047,stroke-width:2px;
+        
+        class data,train,test input;
+        class KF,rf,mask,vocab,sub_train,sub_test preprocessing;
+        class proj_FP,proj_Sub,stack,fuse,MLP module;
+        class out,es output;
+    </div>
+
+    <h2>3. 검증 결과 및 물리적 시각화 분석 (Validation & Visual Analysis)</h2>
+    <p>최종 5-Fold가 달성해 낸 검증 매트릭과 모델 내부 임베딩(Deep Representation)의 공간 분포 시각화 자료입니다. 해당 시각화들은 <code>visualize_embeddings.py</code>에 의해 생성된 공간 해석 자료입니다.</p>
+
+    <div class="figure">
+        <h3>[가항] 모델 학습 곡선 추이 (Training Curve)</h3>
+        <img src="training_curve_fold1.png" alt="Training Curve Fold 1" />
+        <caption>(위 예시는 Fold 1의 곡선 통계로, Loss 수렴 구간 안에 Val AUC가 과거 기준치 대비 한층 약진한 0.81 선을 달성함을 증명합니다. Early Stopping의 칼날 같은 절단점 덕분에 과적합 페이즈에 진입하지 않는 강건함을 보입니다.)</caption>
+    </div>
+
+    <div class="figure">
+        <h3>[나항] 임베딩 활성화 및 변별력 차원 분포 (Heatmap & Discriminative Boxes)</h3>
+        <img src="embedding_heatmap.png" alt="Embedding Heatmap" />
+        <img src="embedding_distribution.png" alt="Embedding Distribution Boxplots" />
+        <caption>(히트맵을 통해 DILI 클래스와 non-DILI 클래스에서 활성화되는 특정 차원 영역이 어떻게 다른지 가시적으로 확인할 수 있습니다. 특히 아래 박스플롯에서 중앙값이 확연히 어긋나게 양분된 Top 차원들은 XGBoost로 넘겨졌을 때 결정나무의 강력한 식별 기준(Information Gain)이 될 수학적 근거를 보여줍니다.)</caption>
+    </div>
+
+    <div class="figure">
+        <h3>[다항] 임베딩 벡터 공간 시각화 (t-SNE 2D Manifold Space)</h3>
+        <img src="embedding_tsne.png" alt="t-SNE Scatter Plot" />
+        <caption>(모델의 최종 출력단 직전에 추출된 128차원의 Attention Representation이 유사성에 따라 군집화된 모습입니다. 빨간색(DILI)과 파란색(non-DILI)이 구역을 형성하고 있으며, 가장 우측 패널에서 볼 수 있듯 Test 데이터들이 Train 데이터 군집에서 전혀 이질감 없이 스며드는 형태는 모델의 막강한 일반화(Generalization) 능력을 시사합니다.)</caption>
+    </div>
+
+    <div class="figure">
+        <h3>[라항] 클래스 및 소스 데이터 불균형 방어</h3>
+        <img src="class_balance.png" alt="Class Balance Pie Chart" />
+        <caption>(Train과 Test 셋 사이에서 라벨의 비율이 완벽하게 동기화된 Stratified 분할을 보여줍니다. Multi-Source 데이터의 극단적인 분포 불가를 원천 차단했습니다.)</caption>
+    </div>
+
+</body>
+</html>
