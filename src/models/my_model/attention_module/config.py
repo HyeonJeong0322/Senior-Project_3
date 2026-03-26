@@ -30,8 +30,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ─────────────────────────────────────────────
 # 2. 데이터 설정
 # ─────────────────────────────────────────────
-SMILES_COL  = "SMILES"       # Dataset.csv 내 SMILES 열 이름 (StackDILI 형식)
-LABEL_COL   = "Label"        # Dataset.csv 내 라벨 열 이름 (0: non-DILI, 1: DILI)
+SMILES_COL  = "smiles"       # Dataset.csv 내 SMILES 열 이름 (StackDILI 형식)
+LABEL_COL   = "binary_label"        # Dataset.csv 내 라벨 열 이름 (0: non-DILI, 1: DILI)
 TEST_SIZE   = 0.2                   # 사용할 테스트 셋 비율, f.e) 0.2 = 20%
 RANDOM_SEED = 42
 

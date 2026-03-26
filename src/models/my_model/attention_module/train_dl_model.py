@@ -25,12 +25,12 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.ensemble import RandomForestClassifier
 
-import config
-from data_preprocessing import (
+from . import config
+from .data_preprocessing import (
     load_all_data,
     collate_graph_batch,
 )
-from model_builder import build_gcn_model
+from .model_builder import build_gcn_model
 
 
 # ─────────────────────────────────────────────────────────────
