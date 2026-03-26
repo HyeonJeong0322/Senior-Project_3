@@ -116,6 +116,94 @@ class OneLayerGCN(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────
+# [NEW] 2-Layer GCN + Residual + Jumping Knowledge (JK-Cat)
+# ─────────────────────────────────────────────────────────────
+
+class TwoLayerGCN(nn.Module):
+    """
+    2-Layer GCN + Residual Connection + Jumping Knowledge (JK-Cat).
+
+    구조:
+      Layer 1 (1-hop): in_dim(25) → hidden_dim(64)
+        H1 = D⁻¹ A W1(x)  →  ReLU + LayerNorm + Dropout
+
+      Layer 2 (2-hop): hidden_dim(64) → out_dim(128) + Residual
+        H2 = D⁻¹ A W2(H1) + W_res(H1)  →  ReLU + LayerNorm + Dropout
+        (W_res: 64→128, 차원 불일치 해소)
+
+      JK-Cat (Jumping Knowledge):
+        H_jk = cat(H1, H2)  →  (B, N, 192)
+        out  = W_jk(H_jk)   →  (B, N, 128)  ← GCN_OUT_DIM 유지
+
+    설계 근거:
+      - Residual: 1-hop 원자 ID(국소 구조)를 2-hop 출력에 직접 더해 Oversmoothing 방지
+      - JK-Cat:   1-hop(국소)과 2-hop(광역) 표현을 병렬 보존 →
+                  GraphAttentionReadout이 어느 스케일이 독성에 중요한지 학습으로 선택
+      - 출력 (B, N, GCN_OUT_DIM=128): NodeFPCrossAttention, GraphAttentionReadout 하위 호환
+    """
+    def __init__(self,
+                 in_dim:     int   = config.GCN_NODE_FEAT_DIM,
+                 hidden_dim: int   = config.GCN_HIDDEN_DIM,
+                 out_dim:    int   = config.GCN_OUT_DIM,
+                 dropout:    float = config.FF_DROPOUT):
+        super().__init__()
+
+        # Layer 1: 1-hop (in → hidden)
+        self.W1    = nn.Linear(in_dim,     hidden_dim, bias=False)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+
+        # Layer 2: 2-hop (hidden → out)
+        self.W2    = nn.Linear(hidden_dim, out_dim, bias=False)
+        self.norm2 = nn.LayerNorm(out_dim)
+
+        # Residual projection (hidden → out, 차원 불일치 해소)
+        self.W_res = nn.Linear(hidden_dim, out_dim, bias=False)
+
+        # JK-Cat projection: cat(H1, H2) = (N, hidden+out) → (N, out)
+        self.W_jk    = nn.Linear(hidden_dim + out_dim, out_dim, bias=False)
+        self.norm_jk = nn.LayerNorm(out_dim)
+
+        self.act  = nn.ReLU(inplace=True)
+        self.drop = nn.Dropout(dropout)
+
+    def _message_pass(self,
+                      h:   torch.Tensor,
+                      adj: torch.Tensor) -> torch.Tensor:
+        """D⁻¹ A H: 차수 정규화된 1-hop Message Passing."""
+        degree = adj.sum(dim=-1, keepdim=True).clamp(min=1.0)  # (B, N, 1)
+        return torch.bmm(adj / degree, h)                       # (B, N, dim)
+
+    def forward(self,
+                x:    torch.Tensor,
+                adj:  torch.Tensor,
+                mask: torch.Tensor) -> torch.Tensor:
+        """
+        x    : (B, max_atoms, in_dim)    — 패딩된 원자 피처 행렬
+        adj  : (B, max_atoms, max_atoms) — self-loop 포함 인접 행렬
+        mask : (B, max_atoms)            — 유효 원자 True, 패딩 False
+        return: (B, max_atoms, out_dim)  — GCN_OUT_DIM 유지
+        """
+        # ── Layer 1: 1-hop ──
+        H0 = self.W1(x)                              # (B, N, hidden)
+        H1 = self._message_pass(H0, adj)             # (B, N, hidden)
+        H1 = self.drop(self.act(self.norm1(H1)))
+        H1 = H1 * mask.unsqueeze(-1).float()         # 패딩 제로화
+
+        # ── Layer 2: 2-hop + Residual ──
+        H2_agg = self._message_pass(self.W2(H1), adj)          # (B, N, out)
+        H2     = self.act(self.norm2(H2_agg + self.W_res(H1))) # Residual
+        H2     = self.drop(H2)
+        H2     = H2 * mask.unsqueeze(-1).float()
+
+        # ── JK-Cat: 두 스케일 병렬 보존 ──
+        H_jk = torch.cat([H1, H2], dim=-1)                     # (B, N, hidden+out)
+        out  = self.drop(self.act(self.norm_jk(self.W_jk(H_jk))))  # (B, N, out)
+        out  = out * mask.unsqueeze(-1).float()
+
+        return out   # (B, N, GCN_OUT_DIM=128)
+
+
+# ─────────────────────────────────────────────────────────────
 # [NEW] Graph Attention Readout
 # ─────────────────────────────────────────────────────────────
 

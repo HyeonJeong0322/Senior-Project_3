@@ -20,6 +20,7 @@ import torch.nn as nn
 from attention_module import (
     CrossedDiffAttentionStack,
     OneLayerGCN,
+    TwoLayerGCN,
     GraphAttentionReadout,
     NodeFPCrossAttention,
     ProjectionBlock,
@@ -98,10 +99,11 @@ class DILIAttentionModel(nn.Module):
 
 class DILIGCNModel(nn.Module):
     """
-    신규 파이프라인 (1-Layer GCN + 진짜 Crossed Attention):
+    신규 파이프라인 (2-Layer GCN + Residual + JK + 진짜 Crossed Attention):
 
     fp_input (B, fp_dim)                  → ProjectionBlock   → fp_vec   (B, PROJECT_DIM)
-    graph (B,N,feat), adj (B,N,N), mask   → OneLayerGCN       → node_mat (B, N, GCN_OUT_DIM)
+    graph (B,N,feat), adj (B,N,N), mask   → TwoLayerGCN       → node_mat (B, N, GCN_OUT_DIM)
+                                            (1-hop→2-hop, Residual+JK-Cat)
 
     [Crossed Attention — 양방향 독립 스트림]
       Pass 2: Node_i(Q) → fp_vec(K,V) → node_mat_updated  (각 원자가 전역 FP 참조)
@@ -126,11 +128,12 @@ class DILIGCNModel(nn.Module):
         # ① FP Projection Block (Global feature 차원 통일)
         self.fp_proj = ProjectionBlock(fp_dim, config.PROJECT_DIM, config.FF_DROPOUT)
 
-        # ② 1-Layer GCN (Local topology encoder)
-        self.gcn = OneLayerGCN(
-            in_dim  = config.GCN_NODE_FEAT_DIM,
-            out_dim = config.GCN_OUT_DIM,
-            dropout = config.FF_DROPOUT,
+        # ② 2-Layer GCN + Residual + JK-Cat (Local topology encoder)
+        self.gcn = TwoLayerGCN(
+            in_dim     = config.GCN_NODE_FEAT_DIM,
+            hidden_dim = config.GCN_HIDDEN_DIM,
+            out_dim    = config.GCN_OUT_DIM,
+            dropout    = config.FF_DROPOUT,
         )
 
         # ③ Crossed Attention Pass 2: 각 원자가 전역 FP를 참조 (GCN → FP 방향)
