@@ -1,80 +1,52 @@
-# DILI ML Experiment Platform
+# 환경 설정 가이드
 
-이 프로젝트는 다양한 머신러닝 모델을 **동일한 환경에서 실행하고 성능을 비교**하기 위한 실험 플랫폼입니다.
-
-Docker 기반으로 구성되어 있어, Mac / Windows 관계없이 동일한 환경에서 실행할 수 있습니다.
+처음 프로젝트를 세팅할 때 이 문서를 따라하세요.
 
 ---
 
-## 📦 프로젝트 목표
+## 1. Docker Desktop 설치
 
-* 팀원 간 **환경 차이 제거**
-* 다양한 모델을 **같은 데이터셋으로 비교**
-* 실험 과정을 **자동화 (Makefile + Docker)**
+[https://www.docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop)
 
----
-
-## 🧱 전체 구조
-
-```
-.
-├── docker-compose.yml
-├── Dockerfile
-├── Makefile
-├── environment.yml
-├── src/
-│   ├── train.py
-│   ├── registry.py
-│   └── models/
-│       ├── stackdili/  (StackDILI clone)
-│       │   ├── model.py
-│       │   ├── Code/
-│       │   ├── Feature/
-│       │   └── Model/
-│       └── my_model/  (우리가 개발할 모델을 여기로 추가)
-```
+설치 후 Docker Desktop을 **실행(켜둔) 상태**로 유지해야 합니다.
 
 ---
 
-## 🚀 처음 시작하는 방법 (중요 ⭐)
+## 2. 프로젝트 클론
 
-### 1️⃣ Docker 설치
-
-👉 아래 사이트에서 Docker Desktop 설치
-
-* [https://www.docker.com/products/docker-desktop/](https://www.docker.com/products/docker-desktop/)
-
-설치 후 실행까지 해줘야 함. 
-
----
-
-### 2️⃣ 프로젝트 클론
-
-```
+```bash
 git clone <repo-url>
 cd Dili
 ```
 
 ---
 
-### 3️⃣ 이미지 빌드 (최초 1회)
+## 3. 이미지 빌드 (최초 1회)
 
+**Mac / Linux**
+```bash
+./run.sh build
 ```
-make build
+
+**Windows (Git Bash 또는 WSL)**
+```bash
+bash run.sh build
 ```
 
-👉 Python, RDKit, PyTorch 등 필요한 라이브러리가 모두 설치됩니다.
-
+Python, RDKit, PyTorch, XGBoost 등 필요한 라이브러리가 모두 설치됩니다.
+처음 빌드는 몇 분 걸릴 수 있습니다.
 
 ---
 
-### (+) 설치된 환경 확인  
+## 4. 환경 확인
 
-```
-make env_test
+```bash
+./run.sh env-test       # Mac/Linux
+bash run.sh env-test    # Windows
 ```
 
-👉 설치된 라이브러리들의 버전 정보가 나옵니다. 정상적으로 환경이 세팅되었다면 아래와 같이 출력됩니다. 
+정상 설치 시 아래와 같이 출력됩니다.
+
 ```
 === 환경 체크 시작 ===
 
@@ -87,202 +59,42 @@ make env_test
 [OK] xgboost
 
 === 상세 체크 ===
-torch version: 2.10.0
+torch version: 2.x.x
 rdkit test: True
 torch_geometric OK
-xgboost version: 3.2.0
+xgboost version: x.x.x
 
 === 완료 ===
 ```
 
-- 추가로 설치해야 하는 라이브러리가 있다면 백지은에게 전달해주세요! 
+설치가 안 된 라이브러리가 있으면 백지은에게 알려주세요.
 
 ---
 
-## 🧪 모델 실행 방법
+## 5. 데이터 준비
 
-### StackDILI 실행
-
-```
-make run MODEL=stackdili
-```
-
-실행 흐름:
-
-1. ML_model.ipynb 실행 (기본 모델 학습)
-2. stacking.ipynb 실행 (Stacking 수행)
-3. AUC 결과 출력
-
-예시:
+모델 실행 전에 데이터 파일을 아래 경로에 넣어야 합니다.
 
 ```
-StackDILI AUC: 0.97
+data/dilirank.csv
 ```
+
+파일이 없으면 모델 실행 시 오류가 발생합니다.
 
 ---
 
-## 📊 결과 확인
+## 문제 발생 시
 
-StackDILI 결과는 아래 파일에 저장됩니다:
-
-```
-src/models/stackdili/result.txt
-```
-
----
-
-## ⚙️ 자주 사용하는 명령어
-
-### 컨테이너 접속
-
-```
-make shell
-```
-
-👉 내부에서 직접 디버깅 가능
-
----
-
-### 컨테이너 정리 (에러 날 때)
-
-```
+**빌드 실패 또는 실행 오류**
+```bash
 docker compose down --remove-orphans
+./run.sh build
 ```
 
----
-
-## 🧠 코드 구조 설명 (핵심)
-
-### train.py
-
-* 전체 실행 진입점
-* MODEL 파라미터로 어떤 모델 실행할지 결정
-
----
-
-### registry.py
-
-* 모델을 이름으로 관리
-
-예:
-
-```
-MODEL_REGISTRY = {
-    "stackdili": StackDILI
-}
+**컨테이너 내부에서 직접 확인하고 싶을 때**
+```bash
+./run.sh shell      # Mac/Linux
+bash run.sh shell   # Windows
 ```
 
----
-
-### model.py (각 모델 폴더 내부)
-
-* 실제 모델 실행 코드
-* 반드시 아래 구조를 따라야 함
-
-```
-class Model:
-    def train(self, _):
-        pass
-
-    def predict(self, _):
-        pass
-```
-
----
-
-## 📁 StackDILI 구조 설명
-
-```
-stackdili/
-├── Code/        # notebook 실행 위치
-├── Feature/     # 데이터
-├── Model/       # 학습된 모델 저장
-```
-
----
-
-## ⚠️ 주의사항
-
-### 1. 경로 문제
-
-Notebook은 Code 폴더 기준으로 실행됩니다.
-
-따라서:
-
-```
-../Feature/Feature.csv
-```
-
-처럼 접근해야 합니다.
-
----
-
-### 2. 실행 순서 중요
-
-StackDILI는 아래 순서를 따릅니다:
-
-1. ML_model.ipynb
-2. stacking.ipynb
-
----
-
-## 🧩 새로운 모델 추가 방법
-
-### 1️⃣ 폴더 생성
-
-```
-src/models/my_model/
-```
-
----
-
-### 2️⃣ model.py 작성
-
-```
-class Model:
-    def train(self, _):
-        print("My model training")
-
-    def predict(self, _):
-        return None
-```
-
----
-
-### 3️⃣ registry 등록
-
-```
-from models.my_model.model import Model as MYMODEL
-
-MODEL_REGISTRY = {
-    "stackdili": STACKDILI,
-    "my_model": MYMODEL
-}
-```
-
----
-
-### 4️⃣ 실행
-
-```
-make run MODEL=my_model (우리가 개발한 모델)
-make run MODEL=stackdili (실행 시 StackDILI ALU 출력됨)
-```
-
----
-
-## 💡 협업 방식
-
-* 모든 코드는 GitHub에 push
-* Docker 환경은 동일 → “내 컴퓨터에서는 되는데?” 문제 없음
-* 모델만 추가해서 비교 가능
-
----
-
-## 🙋‍♀️ 문제 발생 시
-
-1. make build 다시 실행
-2. docker compose down --remove-orphans
-3. make run 재실행
-
-그래도 안 되면 팀원에게 로그 공유 👍
+그래도 해결 안 되면 터미널 로그를 팀원에게 공유해주세요.
