@@ -27,7 +27,7 @@ from rdkit.Chem import (
 from rdkit.Chem.Scaffolds import MurckoScaffold
 from tqdm import tqdm
 
-import config
+from . import config
 
 # Morgan Generator (Deprecation 경고 제거)
 _morgan_gen = rdFingerprintGenerator.GetMorganGenerator(
@@ -165,10 +165,10 @@ def mol_to_graph(mol) -> tuple[np.ndarray, np.ndarray]:
 
     ※ attention_module.atom_features()와 반드시 동일한 피처 정의를 사용해야 함.
     """
-    from attention_module import atom_features  # 순환참조 방지를 위해 지역 import
+    from .attention_module import atom_features  # 순환참조 방지를 위해 지역 import
 
-    # 수소 추가 없이 중원자(Heavy Atom)만 대상
-    n = mol.GetNumHeavyAtoms()
+    # 수소 추가 없이 중원자(Heavy Atom)만 대상 (단, RDKit 예외로 남은 H도 포함되도록 전체 Atom 수 기준)
+    n = mol.GetNumAtoms()
 
     # 원자 피처 행렬
     feat_list = [atom_features(atom) for atom in mol.GetAtoms()]
@@ -282,5 +282,3 @@ if __name__ == "__main__":
     print("fp_all shape :", fp_all.shape)
     print("그래프 샘플 node_feats shape:", graphs_all[0][0].shape)
     print("그래프 샘플 adj shape:", graphs_all[0][1].shape)
-
-

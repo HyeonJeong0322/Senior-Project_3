@@ -13,6 +13,11 @@ train_dl_model.py  (— End-to-End 학습 및 임베딩 추출)
 """
 
 import os
+import warnings
+
+# PyTorch SequentialLR 내부 버그로 인한 경고 무시
+warnings.filterwarnings("ignore", category=UserWarning, module=".*lr_scheduler.*")
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -26,12 +31,12 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import VarianceThreshold
 
-import config
-from data_preprocessing import (
+from . import config
+from .data_preprocessing import (
     load_all_data,
     collate_graph_batch,
 )
-from model_builder import build_gcn_model
+from .model_builder import build_gcn_model
 
 
 # ─────────────────────────────────────────────────────────────
@@ -336,20 +341,78 @@ def main():
     print("\n" + "="*50)
     print(f"[완료] K-Fold 학습 종료 (평균 AUC: {np.mean(fold_aucs):.4f} +/- {np.std(fold_aucs):.4f})")
 
-    # 8. 5개의 임베딩 배열 산술 평균 → 최종 저장 (Person B 용도)
-    ensemble_train_embs = np.mean(train_embs_list, axis=0)
-    ensemble_test_embs  = np.mean(test_embs_list,  axis=0)
+    # 7. 5-Fold 앙상블로 임베딩 추출 (Data Leakage 차단)
+    print(f"\n[임베딩 추출 - 5-Fold 앙상블 추출 모드]")
 
-    np.save(config.EMBEDDING_TRAIN_PATH, ensemble_train_embs)
-    np.save(config.LABEL_TRAIN_PATH,     y_tv)
-    np.save(config.EMBEDDING_TEST_PATH,  ensemble_test_embs)
-    np.save(config.LABEL_TEST_PATH,      y_test)
+    # ── OOF 방식 Train embedding 생성 ───────────────────────
+    print(f"\n[임베딩 추출 - OOF 방식]")
 
-    print(f"\n[완료] 5-Fold 앙상블 기반 임베딩 추출 & 저장 완료.")
-    print(f"   Train 임베딩 차원: {ensemble_train_embs.shape}  -> {config.EMBEDDING_TRAIN_PATH}")
+    train_embs = None
+    test_embs_list = []
+
+    kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=config.RANDOM_SEED)
+
+    for fold_idx, (_, val_idx) in enumerate(kf.split(np.zeros(len(y_tv)), y_tv)):
+        print(f"  > Fold {fold_idx + 1} 모델로 OOF 임베딩 추출 중...")
+
+        m_info = fold_models_info[fold_idx]
+        top_k_idx = m_info['top_k_idx']
+
+        best_model = build_gcn_model(m_info['fp_dim'], device)
+        best_model.load_state_dict(torch.load(m_info['model_path'], map_location=device, weights_only=True))
+
+        # RF 적용
+        fp_tv_sel   = fp_tv[:, top_k_idx]
+        fp_test_sel = fp_test[:, top_k_idx]
+
+        # validation만 embedding 생성
+        emb_val = extract_embeddings_memory(
+            best_model,
+            fp_tv_sel[val_idx],
+            [graphs_tv[i] for i in val_idx],
+            device
+        )
+
+        # 🔥 핵심: 여기에서 차원 자동 생성
+        if train_embs is None:
+            train_embs = np.zeros((len(fp_tv), emb_val.shape[1]))
+
+        train_embs[val_idx] = emb_val
+
+        # test는 평균용
+        emb_test = extract_embeddings_memory(best_model, fp_test_sel, graphs_test, device)
+        test_embs_list.append(emb_test)
+
+    # test는 평균
+    ensemble_test_embs = np.mean(test_embs_list, axis=0)
+
+    # 저장
+    np.save(config.EMBEDDING_TRAIN_PATH, train_embs)
+    np.save(config.LABEL_TRAIN_PATH, y_tv)
+
+    np.save(config.EMBEDDING_TEST_PATH, ensemble_test_embs)
+    np.save(config.LABEL_TEST_PATH, y_test)
+
+    # -------------------------------------------------------------
+    # 수정을 좀 했습니다... 
+
+    import os
+    # 폴더가 없을 경우를 대비해 확실히 경로를 잡아줍니다 (선택사항이지만 안전함)
+    output_dir = "/app/src/models/my_model/outputs"
+    os.makedirs(output_dir, exist_ok=True)
+
+    np.save(f"{output_dir}/train_fps.npy", fp_tv)
+    np.save(f"{output_dir}/test_fps.npy", fp_test)
+    
+    # -------------------------------------------------------------
+
+    print(f"\n[완료] OOF 기반 임베딩 추출 & 저장 완료.")
+    print(f"   Train 임베딩 차원: {train_embs.shape}  -> {config.EMBEDDING_TRAIN_PATH}")
     print(f"   Test  임베딩 차원: {ensemble_test_embs.shape}  -> {config.EMBEDDING_TEST_PATH}")
     print(f"   (임베딩 차원 = 2 * PROJECT_DIM = 256-dim, Person B 연동 대기중)")
 
+    print(f"   Train FP 차원: {fp_tv.shape} -> {output_dir}/train_fps.npy")
+    print(f"   Test  FP 차원: {fp_test.shape} -> {output_dir}/test_fps.npy")
 
 if __name__ == "__main__":
     main()

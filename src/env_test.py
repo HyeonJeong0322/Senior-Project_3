@@ -7,7 +7,11 @@ packages = [
     "rdkit",
     "torch_geometric",
     "sklearn",
-    "xgboost"
+    "xgboost",
+    "lightgbm",
+    "matplotlib",
+    "tqdm",
+    "nbconvert",      # stackdili 노트북 실행용
 ]
 
 print("=== 환경 체크 시작 ===\n")
@@ -15,39 +19,47 @@ print("=== 환경 체크 시작 ===\n")
 for pkg in packages:
     try:
         importlib.import_module(pkg)
-        print(f"[OK] {pkg}")
+        print(f"[OK]   {pkg}")
     except ImportError:
         print(f"[FAIL] {pkg}")
 
-print("\n=== 상세 체크 ===")
+print("\n=== 상세 버전 ===")
 
-# torch
 try:
     import torch
-    print("torch version:", torch.__version__)
-except:
+    print("torch       :", torch.__version__)
+except Exception:
     pass
 
-# rdkit
-try:
-    from rdkit import Chem
-    mol = Chem.MolFromSmiles("CCO")
-    print("rdkit test:", mol is not None)
-except:
-    pass
-
-# torch_geometric
 try:
     import torch_geometric
     print("torch_geometric OK")
-except:
+except Exception:
     pass
 
-# xgboost
+try:
+    from rdkit import Chem
+    mol = Chem.MolFromSmiles("CCO")
+    print("rdkit       : OK" if mol is not None else "rdkit       : FAIL")
+except Exception:
+    pass
+
 try:
     import xgboost
-    print("xgboost version:", xgboost.__version__)
-except:
+    print("xgboost     :", xgboost.__version__)
+except Exception:
+    pass
+
+try:
+    import lightgbm
+    print("lightgbm    :", lightgbm.__version__)
+except Exception:
+    pass
+
+try:
+    import matplotlib
+    print("matplotlib  :", matplotlib.__version__)
+except Exception:
     pass
 
 print("\n=== 완료 ===")
