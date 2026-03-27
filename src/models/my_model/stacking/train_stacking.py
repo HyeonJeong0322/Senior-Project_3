@@ -1,96 +1,149 @@
+# """
+# train_baseline.py (GCN Embedding -> LR & SVM)
+# =============================================================
+# 개선 사항:
+#   ① GCN 임베딩에 적합하지 않은 Tree 기반 모델(RF, XGB 등) 제거
+#   ② 연속형 고차원 데이터에 강한 Logistic Regression과 SVC(SVM) 적용
+#   ③ 데이터 스케일링(StandardScaler) 필수 적용
+#   ④ 불필요한 스태킹 구조를 제거하고 빠르고 직관적인 투표(Voting) 앙상블 사용
+# """
+
+# import warnings
+# warnings.filterwarnings("ignore")
+
+# import numpy as np
+# from sklearn.linear_model import LogisticRegression
+# from sklearn.svm import SVC
+# from sklearn.preprocessing import StandardScaler
+# from sklearn.model_selection import train_test_split
+# from sklearn.metrics import (
+#     roc_auc_score, accuracy_score, matthews_corrcoef, f1_score
+# )
+
+# # ── 경로 설정 ────────────────────────────────────────────────
+# EMBEDDING_TRAIN_PATH = "/app/src/models/my_model/outputs/train_embeddings.npy"
+# EMBEDDING_TEST_PATH  = "/app/src/models/my_model/outputs/test_embeddings.npy"
+# LABEL_TRAIN_PATH     = "/app/src/models/my_model/outputs/train_labels.npy"
+# LABEL_TEST_PATH      = "/app/src/models/my_model/outputs/test_labels.npy"
+
+# RANDOM_SEED = 42
+
+# def _best_threshold_mcc(y_true, y_prob):
+#     """MCC 최대화 threshold 탐색"""
+#     thresholds = np.linspace(0.1, 0.9, 81)
+#     best_mcc, best_thr = -1.0, 0.5
+#     for thr in thresholds:
+#         mcc = matthews_corrcoef(y_true, (y_prob >= thr).astype(int))
+#         if mcc > best_mcc:
+#             best_mcc, best_thr = mcc, thr
+#     return best_thr, best_mcc
+
+# def _print_metrics(label, y_true, y_prob, threshold=0.5):
+#     y_pred = (y_prob >= threshold).astype(int)
+#     print(f"  {label:<22} "
+#           f"AUC={roc_auc_score(y_true, y_prob):.4f}  "
+#           f"ACC={accuracy_score(y_true, y_pred):.4f}  "
+#           f"MCC={matthews_corrcoef(y_true, y_pred):.4f}  "
+#           f"F1={f1_score(y_true, y_pred):.4f}  "
+#           f"thr={threshold:.2f}")
+
+# def main():
+#     np.random.seed(RANDOM_SEED)
+
+#     # 1. 임베딩 로드
+#     print("[1/4] 임베딩 로드 및 스케일링")
+#     X_train_raw = np.load(EMBEDDING_TRAIN_PATH)
+#     y_train = np.load(LABEL_TRAIN_PATH).astype(int)
+#     X_test_raw  = np.load(EMBEDDING_TEST_PATH)
+#     y_test  = np.load(LABEL_TEST_PATH).astype(int)
+    
+#     # LR과 SVM은 스케일에 매우 민감하므로 필수
+#     scaler = StandardScaler()
+#     X_train = scaler.fit_transform(X_train_raw)
+#     X_test  = scaler.transform(X_test_raw)
+    
+#     print(f"   Train: {X_train.shape}  Test: {X_test.shape}")
+
+#     # Threshold 튜닝을 위한 Validation 분할
+#     X_tr, X_val, y_tr, y_val = train_test_split(
+#         X_train, y_train, test_size=0.2, random_state=RANDOM_SEED, stratify=y_train
+#     )
+
+#     # 2. 모델 학습
+#     print("\n[2/4] 선형 기반 분류기 학습 (Logistic Regression & SVM)")
+    
+#     # 모델 1: Logistic Regression
+#     lr = LogisticRegression(random_state=RANDOM_SEED, max_iter=1000, C=0.1, solver="saga")
+#     lr.fit(X_tr, y_tr)
+#     lr_val_proba = lr.predict_proba(X_val)[:, 1]
+    
+#     # 모델 2: SVC (Support Vector Machine)
+#     svc = SVC(random_state=RANDOM_SEED, probability=True, C=1.0, kernel='rbf')
+#     svc.fit(X_tr, y_tr)
+#     svc_val_proba = svc.predict_proba(X_val)[:, 1]
+
+#     # Validation 기반 앙상블 및 최적 임계값 찾기
+#     val_final_proba = (lr_val_proba + svc_val_proba) / 2
+#     best_thr, _ = _best_threshold_mcc(y_val, val_final_proba)
+#     print(f"   최적 threshold (MCC 기준, val): {best_thr:.2f}")
+
+#     # 3. 전체 Train 데이터로 최종 재학습 (성능 극대화)
+#     print("\n[3/4] 전체 Train 데이터로 재학습 중...")
+#     lr.fit(X_train, y_train)
+#     svc.fit(X_train, y_train)
+
+#     lr_test_proba = lr.predict_proba(X_test)[:, 1]
+#     svc_test_proba = svc.predict_proba(X_test)[:, 1]
+#     final_test_proba = (lr_test_proba + svc_test_proba) / 2
+
+#     # 4. 평가
+#     print("\n[4/4] 최종 평가")
+#     print("=" * 65)
+#     print("  결과 비교 (GCN Embedding Baseline)")
+#     print("=" * 65)
+#     _print_metrics("Logistic Reg (0.5)", y_test, lr_test_proba, 0.5)
+#     _print_metrics("SVM (0.5)", y_test, svc_test_proba, 0.5)
+#     _print_metrics("LR + SVM 앙상블 (0.5)", y_test, final_test_proba, 0.5)
+#     _print_metrics(f"LR + SVM ({best_thr:.2f})", y_test, final_test_proba, best_thr)
+#     print("=" * 65)
+
+# if __name__ == "__main__":
+#     main()
+
 """
-train_stacking_v2.py  (Step 2 — Upgraded Stacking Ensemble)
+train_twostream.py (Stacking Ensemble Version)
 =============================================================
-개선 사항:
-  ① OOF 스태킹 (리케이지 없음)
-  ② LightGBM 추가 → base 모델 5개로 다양성 확보
-  ③ 메타 모델 2개 (ExtraTrees + LogisticRegression) → 앙상블
-  ④ top-3 seed 평균 → 안정성 + 성능
-  ⑤ 메타 입력에 원본 임베딩 concat → 패턴 보완
-  ⑥ F1/MCC 기준 threshold 자동 튜닝
+Track 1 (Graph/GCN) + Track 2 (Tabular/Fingerprint) 예측값을 기반으로
+Meta-Learner(Logistic Regression)가 최적의 결합 비율을 학습하는 구조입니다.
 """
 
+import os
 import warnings
-warnings.filterwarnings("ignore", message="X does not have valid feature names")
-warnings.filterwarnings("ignore", category=UserWarning, module="lightgbm")
+warnings.filterwarnings("ignore")
 
 import numpy as np
-from sklearn.exceptions import ConvergenceWarning
-warnings.filterwarnings("ignore", category=ConvergenceWarning)
-
-from sklearn.ensemble import (
-    RandomForestClassifier,
-    ExtraTreesClassifier,
-    HistGradientBoostingClassifier,
-)
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold, train_test_split
-from sklearn.metrics import (
-    roc_auc_score, accuracy_score, matthews_corrcoef,
-    f1_score, precision_score, recall_score
-)
-from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    roc_auc_score, accuracy_score, matthews_corrcoef, f1_score
+)
 
 # ── 경로 설정 ────────────────────────────────────────────────
 EMBEDDING_TRAIN_PATH = "/app/src/models/my_model/outputs/train_embeddings.npy"
 EMBEDDING_TEST_PATH  = "/app/src/models/my_model/outputs/test_embeddings.npy"
+FP_TRAIN_PATH = "/app/src/models/my_model/outputs/train_fps.npy"
+FP_TEST_PATH  = "/app/src/models/my_model/outputs/test_fps.npy"
 LABEL_TRAIN_PATH     = "/app/src/models/my_model/outputs/train_labels.npy"
 LABEL_TEST_PATH      = "/app/src/models/my_model/outputs/test_labels.npy"
 
-# ── 하이퍼파라미터 ───────────────────────────────────────────
-N_BASE_RUNS   = 5     # base 모델 seed 탐색 횟수
-N_META_RUNS   = 10    # 메타 모델 seed 탐색 횟수
-TOP_K_SEEDS   = 3     # top-k seed 평균 (④)
-N_FOLDS       = 5     # OOF fold 수
-RANDOM_SEED   = 42
-USE_EMB_CONCAT = True  # 메타 입력에 임베딩 concat 여부 (⑤)
-
-# ── StackDILI 비교값 (논문에서 확인 후 입력) ─────────────────
-STACKDILI = {"AUC": 0.974, "ACC": 0.927, "MCC": 0.854}
-
-# ── base 모델 스펙 ───────────────────────────────────────────
-BASE_SPECS = [
-    ("RF",     RandomForestClassifier,        {"n_estimators": 300}),
-    ("ET",     ExtraTreesClassifier,           {"n_estimators": 300}),
-    ("HistGB", HistGradientBoostingClassifier, {}),
-    ("XGB",    XGBClassifier,                  {"n_estimators": 300,
-                                                "eval_metric": "logloss",
-                                                "verbosity": 0}),
-    ("LGBM",   LGBMClassifier,                 {"n_estimators": 300,   # ② 추가
-                                                "verbose": -1}),
-]
-
-
-# ─────────────────────────────────────────────────────────────
-# 유틸
-# ─────────────────────────────────────────────────────────────
-
-def _search_seeds(ModelClass, X_tr, y_tr, X_val, y_val, n_runs, **kwargs):
-    """n_runs번 랜덤 seed 탐색 → (seed, auc) 리스트 반환 (내림차순)."""
-    results = []
-    for seed in np.random.randint(0, 10000, size=n_runs):
-        seed = int(seed)
-        m = ModelClass(random_state=seed, **kwargs)
-        m.fit(X_tr, y_tr)
-        auc = roc_auc_score(y_val, m.predict_proba(X_val)[:, 1])
-        results.append((seed, auc))
-    return sorted(results, key=lambda x: -x[1])
-
-
-def _top_k_predict(ModelClass, seeds, X_fit, y_fit, X_pred, **kwargs):
-    """top-k seed로 각각 학습 후 확률 평균 (④)."""
-    probs = []
-    for seed, _ in seeds:
-        m = ModelClass(random_state=seed, **kwargs)
-        m.fit(X_fit, y_fit)
-        probs.append(m.predict_proba(X_pred)[:, 1])
-    return np.mean(probs, axis=0)
-
+RANDOM_SEED = 42
 
 def _best_threshold_mcc(y_true, y_prob):
-    """MCC 최대화 threshold 탐색 (③)."""
     thresholds = np.linspace(0.1, 0.9, 81)
     best_mcc, best_thr = -1.0, 0.5
     for thr in thresholds:
@@ -99,154 +152,108 @@ def _best_threshold_mcc(y_true, y_prob):
             best_mcc, best_thr = mcc, thr
     return best_thr, best_mcc
 
-
 def _print_metrics(label, y_true, y_prob, threshold=0.5):
     y_pred = (y_prob >= threshold).astype(int)
-    print(f"  {label:<32} "
+    print(f"  {label:<25} "
           f"AUC={roc_auc_score(y_true, y_prob):.4f}  "
           f"ACC={accuracy_score(y_true, y_pred):.4f}  "
           f"MCC={matthews_corrcoef(y_true, y_pred):.4f}  "
           f"F1={f1_score(y_true, y_pred):.4f}  "
           f"thr={threshold:.2f}")
 
-
-# ─────────────────────────────────────────────────────────────
-# 메인
-# ─────────────────────────────────────────────────────────────
-
 def main():
     np.random.seed(RANDOM_SEED)
 
-    # ── 1. 임베딩 로드 ──────────────────────────────────────
-    print("[1/5] 임베딩 로드")
-    X_train = np.load(EMBEDDING_TRAIN_PATH)
+    print("[1/4] 데이터 로드 및 전처리")
     y_train = np.load(LABEL_TRAIN_PATH).astype(int)
-    X_test  = np.load(EMBEDDING_TEST_PATH)
     y_test  = np.load(LABEL_TEST_PATH).astype(int)
-    print(f"   Train: {X_train.shape}  Test: {X_test.shape}")
 
-    n_models = len(BASE_SPECS)
+    # Track 1 데이터 
+    X_train_emb_raw = np.load(EMBEDDING_TRAIN_PATH)
+    X_test_emb_raw  = np.load(EMBEDDING_TEST_PATH)
+    scaler = StandardScaler()
+    X_train_emb = scaler.fit_transform(X_train_emb_raw)
+    X_test_emb  = scaler.transform(X_test_emb_raw)
 
-    # ── 2. OOF 스태킹 행렬 생성 ─────────────────────────────
-    print(f"\n[2/5] OOF 스태킹 행렬 생성 ({N_FOLDS}-Fold)")
-    train_stack = np.zeros((len(X_train), n_models))
-    test_stack  = np.zeros((len(X_test),  n_models))
+    # Track 2 데이터 
+    X_train_fp = np.load(FP_TRAIN_PATH)
+    X_test_fp  = np.load(FP_TEST_PATH)
 
-    kf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+    print(f"   Graph 임베딩 (Track 1) dim: {X_train_emb.shape}")
+    print(f"   Fingerprint (Track 2) dim : {X_train_fp.shape}")
 
-    for col_idx, (name, Cls, kwargs) in enumerate(BASE_SPECS):
-        print(f"\n  [{name}]")
-        fold_test_probs = []
-
-        for fold, (tr_idx, val_idx) in enumerate(kf.split(X_train, y_train)):
-            X_tr, y_tr = X_train[tr_idx], y_train[tr_idx]
-            X_val, y_val = X_train[val_idx], y_train[val_idx]
-
-            # top-k seed 탐색
-            ranked = _search_seeds(Cls, X_tr, y_tr, X_val, y_val, N_BASE_RUNS, **kwargs)
-            top_k  = ranked[:TOP_K_SEEDS]
-
-            # OOF 예측 (top-k 평균) ④
-            oof_prob  = _top_k_predict(Cls, top_k, X_tr, y_tr, X_val, **kwargs)
-            test_prob = _top_k_predict(Cls, top_k, X_tr, y_tr, X_test, **kwargs)
-
-            train_stack[val_idx, col_idx] = oof_prob
-            fold_test_probs.append(test_prob)
-
-            best_auc = ranked[0][1]
-            print(f"    Fold {fold+1}  val AUC(best): {best_auc:.4f}")
-
-        # fold 평균으로 test_stack 확정
-        test_stack[:, col_idx] = np.mean(fold_test_probs, axis=0)
-
-    print(f"\n   Train stack: {train_stack.shape}  Test stack: {test_stack.shape}")
-
-    # ── 3. 메타 입력 구성 (임베딩 concat) ───────────────────
-    if USE_EMB_CONCAT:
-        print("\n[3/5] 메타 입력 = stack proba + 원본 임베딩 concat")
-        # 임베딩 스케일 맞추기 (LR이 scale에 민감)
-        scaler = StandardScaler()
-        emb_train_scaled = scaler.fit_transform(X_train)
-        emb_test_scaled  = scaler.transform(X_test)
-
-        meta_X_train = np.hstack([train_stack, emb_train_scaled])
-        meta_X_test  = np.hstack([test_stack,  emb_test_scaled])
-        print(f"   메타 입력 dim: {meta_X_train.shape[1]}  "
-              f"({n_models} proba + {X_train.shape[1]} emb)")
-    else:
-        meta_X_train, meta_X_test = train_stack, test_stack
-
-    # ── 4. 메타 모델 학습 ────────────────────────────────────
-    # 메타 모델 ①: ExtraTreesClassifier (트리)
-    # 메타 모델 ②: LogisticRegression   (선형) → 서로 보완 ①
-    print("\n[4/5] 메타 모델 학습")
-
-    Xs_tr, Xs_val, ys_tr, ys_val = train_test_split(
-        meta_X_train, y_train,
-        test_size=0.2, random_state=RANDOM_SEED, stratify=y_train
+    # Meta-Learner 학습을 위한 데이터 분할 (Hold-out for Stacking)
+    idx_train, idx_val = train_test_split(
+        np.arange(len(y_train)), test_size=0.2, random_state=RANDOM_SEED, stratify=y_train
     )
 
-    # ExtraTreesClassifier
-    et_ranked   = _search_seeds(
-        ExtraTreesClassifier, Xs_tr, ys_tr, Xs_val, ys_val,
-        N_META_RUNS, n_estimators=200
-    )
-    et_top_k    = et_ranked[:TOP_K_SEEDS]
-    et_proba    = _top_k_predict(
-        ExtraTreesClassifier, et_top_k,
-        meta_X_train, y_train, meta_X_test, n_estimators=200
-    )
-    print(f"   ET  meta val AUC (best): {et_ranked[0][1]:.4f}")
+    # 2. Track 1 학습
+    print("\n[2/4] Track 1 학습 중... (Graph Embeddings -> Linear Models)")
+    lr = LogisticRegression(random_state=RANDOM_SEED, max_iter=1000, C=0.1, solver="saga")
+    svc = SVC(random_state=RANDOM_SEED, probability=True, C=1.0, kernel='rbf')
 
-    # LogisticRegression (scale 이미 맞춰져 있음)
-    lr_ranked = []
-    for seed in np.random.randint(0, 10000, size=N_META_RUNS):
-        seed = int(seed)
-        lr = LogisticRegression(
-            random_state=seed, max_iter=5000, C=0.1, solver="saga"
-        )
-        lr.fit(Xs_tr, ys_tr)
-        auc = roc_auc_score(ys_val, lr.predict_proba(Xs_val)[:, 1])
-        lr_ranked.append((seed, auc, lr))
-    lr_ranked.sort(key=lambda x: -x[1])
+    lr.fit(X_train_emb[idx_train], y_train[idx_train])
+    svc.fit(X_train_emb[idx_train], y_train[idx_train])
+    
+    track1_val_proba = (lr.predict_proba(X_train_emb[idx_val])[:, 1] + svc.predict_proba(X_train_emb[idx_val])[:, 1]) / 2
 
-    # top-k LR 평균
-    lr_proba_list = []
-    for seed, _, _ in lr_ranked[:TOP_K_SEEDS]:
-        lr = LogisticRegression(
-            random_state=seed, max_iter=5000, C=0.1, solver="saga"
-        )
-        lr.fit(meta_X_train, y_train)
-        lr_proba_list.append(lr.predict_proba(meta_X_test)[:, 1])
-    lr_proba = np.mean(lr_proba_list, axis=0)
-    print(f"   LR  meta val AUC (best): {lr_ranked[0][1]:.4f}")
+    lr.fit(X_train_emb, y_train)
+    svc.fit(X_train_emb, y_train)
+    track1_test_proba = (lr.predict_proba(X_test_emb)[:, 1] + svc.predict_proba(X_test_emb)[:, 1]) / 2
 
-    # 두 메타 모델 평균 앙상블 ①
-    final_proba = (et_proba + lr_proba) / 2
+    # 3. Track 2 학습
+    print("[3/4] Track 2 학습 중... (Fingerprints -> Tree Models)")
+    rf = RandomForestClassifier(n_estimators=300, random_state=RANDOM_SEED)
+    xgb = XGBClassifier(n_estimators=300, random_state=RANDOM_SEED, eval_metric="logloss", verbosity=0)
+    lgbm = LGBMClassifier(n_estimators=300, random_state=RANDOM_SEED, verbose=-1)
 
-    # ── 5. threshold 튜닝 + 최종 평가 ───────────────────────
-    print("\n[5/5] threshold 튜닝 + 최종 평가")
-    best_thr, _ = _best_threshold_mcc(y_test, final_proba)
-    print(f"   최적 threshold (MCC 기준): {best_thr:.2f}")
+    rf.fit(X_train_fp[idx_train], y_train[idx_train])
+    xgb.fit(X_train_fp[idx_train], y_train[idx_train])
+    lgbm.fit(X_train_fp[idx_train], y_train[idx_train])
 
-    print("\n" + "=" * 72)
-    print("  결과 비교")
-    print("=" * 72)
-    _print_metrics("ET  meta (0.5)",         y_test, et_proba,    0.5)
-    _print_metrics("LR  meta (0.5)",         y_test, lr_proba,    0.5)
-    _print_metrics("ET+LR 앙상블 (0.5)",     y_test, final_proba, 0.5)
-    _print_metrics(f"ET+LR 앙상블 ({best_thr:.2f})", y_test, final_proba, best_thr)
-    print("-" * 72)
+    track2_val_proba = (rf.predict_proba(X_train_fp[idx_val])[:, 1] + xgb.predict_proba(X_train_fp[idx_val])[:, 1] + lgbm.predict_proba(X_train_fp[idx_val])[:, 1]) / 3
 
-    if all(v is not None for v in STACKDILI.values()):
-        print(f"  {'StackDILI':<32} "
-              f"AUC={STACKDILI['AUC']:.4f}  "
-              f"ACC={STACKDILI['ACC']:.4f}  "
-              f"MCC={STACKDILI['MCC']:.4f}")
-    else:
-        print("  StackDILI: STACKDILI 딕셔너리에 논문 수치 입력 필요")
-    print("=" * 72)
+    rf.fit(X_train_fp, y_train)
+    xgb.fit(X_train_fp, y_train)
+    lgbm.fit(X_train_fp, y_train)
+    track2_test_proba = (rf.predict_proba(X_test_fp)[:, 1] + xgb.predict_proba(X_test_fp)[:, 1] + lgbm.predict_proba(X_test_fp)[:, 1]) / 3
 
+    # 4. Meta-Learner (Stacking) 학습 및 평가
+    print("\n[4/4] Meta-Learner (Stacking) 학습 및 최종 평가")
+    
+    # Validation 예측값을 피처로 묶어 메타 모델 학습
+    X_meta_train = np.column_stack((track1_val_proba, track2_val_proba))
+    y_meta_train = y_train[idx_val]
+
+    meta_model = LogisticRegression(random_state=RANDOM_SEED, class_weight='balanced')
+    meta_model.fit(X_meta_train, y_meta_train)
+
+    # 심판이 부여한 가중치 확인
+    weights = meta_model.coef_[0]
+    print(f"   [심판의 판정] Track 1 가중치: {weights[0]:.4f} | Track 2 가중치: {weights[1]:.4f}")
+
+    # 최종 Test 예측
+    X_meta_test = np.column_stack((track1_test_proba, track2_test_proba))
+    stacking_test_proba = meta_model.predict_proba(X_meta_test)[:, 1]
+
+    # 단순 5:5 평균 (비교용)
+    simple_avg_proba = (track1_test_proba + track2_test_proba) / 2
+
+    # 메타 모델의 최적 Threshold 탐색
+    stacking_val_proba = meta_model.predict_proba(X_meta_train)[:, 1]
+    best_thr, _ = _best_threshold_mcc(y_meta_train, stacking_val_proba)
+    print(f"   최적 threshold (MCC 기준, val): {best_thr:.2f}")
+
+    print("\n" + "=" * 70)
+    print("  결과 비교 (Stacking Ensemble)")
+    print("=" * 70)
+    _print_metrics("Track 1 (Graph Only)", y_test, track1_test_proba, 0.5)
+    _print_metrics("Track 2 (Tabular Only)", y_test, track2_test_proba, 0.5)
+    print("-" * 70)
+    _print_metrics("단순 5:5 평균 (비교용)", y_test, simple_avg_proba, 0.5)
+    _print_metrics(f"Stacking 모델 (0.50)", y_test, stacking_test_proba, 0.5)
+    _print_metrics(f"Stacking 모델 ({best_thr:.2f})", y_test, stacking_test_proba, best_thr)
+    print("=" * 70)
 
 if __name__ == "__main__":
     main()
