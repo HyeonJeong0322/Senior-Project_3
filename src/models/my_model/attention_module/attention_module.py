@@ -116,6 +116,94 @@ class OneLayerGCN(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────
+# [NEW] 2-Layer GCN + Residual + Jumping Knowledge (JK-Cat)
+# ─────────────────────────────────────────────────────────────
+
+class TwoLayerGCN(nn.Module):
+    """
+    2-Layer GCN + Residual Connection + Jumping Knowledge (JK-Cat).
+
+    구조:
+      Layer 1 (1-hop): in_dim(25) → hidden_dim(64)
+        H1 = D⁻¹ A W1(x)  →  ReLU + LayerNorm + Dropout
+
+      Layer 2 (2-hop): hidden_dim(64) → out_dim(128) + Residual
+        H2 = D⁻¹ A W2(H1) + W_res(H1)  →  ReLU + LayerNorm + Dropout
+        (W_res: 64→128, 차원 불일치 해소)
+
+      JK-Cat (Jumping Knowledge):
+        H_jk = cat(H1, H2)  →  (B, N, 192)
+        out  = W_jk(H_jk)   →  (B, N, 128)  ← GCN_OUT_DIM 유지
+
+    설계 근거:
+      - Residual: 1-hop 원자 ID(국소 구조)를 2-hop 출력에 직접 더해 Oversmoothing 방지
+      - JK-Cat:   1-hop(국소)과 2-hop(광역) 표현을 병렬 보존 →
+                  GraphAttentionReadout이 어느 스케일이 독성에 중요한지 학습으로 선택
+      - 출력 (B, N, GCN_OUT_DIM=128): NodeFPCrossAttention, GraphAttentionReadout 하위 호환
+    """
+    def __init__(self,
+                 in_dim:     int   = config.GCN_NODE_FEAT_DIM,
+                 hidden_dim: int   = config.GCN_HIDDEN_DIM,
+                 out_dim:    int   = config.GCN_OUT_DIM,
+                 dropout:    float = config.FF_DROPOUT):
+        super().__init__()
+
+        # Layer 1: 1-hop (in → hidden)
+        self.W1    = nn.Linear(in_dim,     hidden_dim, bias=False)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+
+        # Layer 2: 2-hop (hidden → out)
+        self.W2    = nn.Linear(hidden_dim, out_dim, bias=False)
+        self.norm2 = nn.LayerNorm(out_dim)
+
+        # Residual projection (hidden → out, 차원 불일치 해소)
+        self.W_res = nn.Linear(hidden_dim, out_dim, bias=False)
+
+        # JK-Cat projection: cat(H1, H2) = (N, hidden+out) → (N, out)
+        self.W_jk    = nn.Linear(hidden_dim + out_dim, out_dim, bias=False)
+        self.norm_jk = nn.LayerNorm(out_dim)
+
+        self.act  = nn.ReLU(inplace=True)
+        self.drop = nn.Dropout(dropout)
+
+    def _message_pass(self,
+                      h:   torch.Tensor,
+                      adj: torch.Tensor) -> torch.Tensor:
+        """D⁻¹ A H: 차수 정규화된 1-hop Message Passing."""
+        degree = adj.sum(dim=-1, keepdim=True).clamp(min=1.0)  # (B, N, 1)
+        return torch.bmm(adj / degree, h)                       # (B, N, dim)
+
+    def forward(self,
+                x:    torch.Tensor,
+                adj:  torch.Tensor,
+                mask: torch.Tensor) -> torch.Tensor:
+        """
+        x    : (B, max_atoms, in_dim)    — 패딩된 원자 피처 행렬
+        adj  : (B, max_atoms, max_atoms) — self-loop 포함 인접 행렬
+        mask : (B, max_atoms)            — 유효 원자 True, 패딩 False
+        return: (B, max_atoms, out_dim)  — GCN_OUT_DIM 유지
+        """
+        # ── Layer 1: 1-hop ──
+        H0 = self.W1(x)                              # (B, N, hidden)
+        H1 = self._message_pass(H0, adj)             # (B, N, hidden)
+        H1 = self.drop(self.act(self.norm1(H1)))
+        H1 = H1 * mask.unsqueeze(-1).float()         # 패딩 제로화
+
+        # ── Layer 2: 2-hop + Residual ──
+        H2_agg = self._message_pass(self.W2(H1), adj)          # (B, N, out)
+        H2     = self.act(self.norm2(H2_agg + self.W_res(H1))) # Residual
+        H2     = self.drop(H2)
+        H2     = H2 * mask.unsqueeze(-1).float()
+
+        # ── JK-Cat: 두 스케일 병렬 보존 ──
+        H_jk = torch.cat([H1, H2], dim=-1)                     # (B, N, hidden+out)
+        out  = self.drop(self.act(self.norm_jk(self.W_jk(H_jk))))  # (B, N, out)
+        out  = out * mask.unsqueeze(-1).float()
+
+        return out   # (B, N, GCN_OUT_DIM=128)
+
+
+# ─────────────────────────────────────────────────────────────
 # [NEW] Graph Attention Readout
 # ─────────────────────────────────────────────────────────────
 
@@ -192,6 +280,68 @@ class GraphAttentionReadout(nn.Module):
         return self.norm(z)
 
 
+
+# ─────────────────────────────────────────────────────────────
+# [NEW] Cross Attention Pass 2: 각 원자(Node)가 전역 FP를 참조
+# ─────────────────────────────────────────────────────────────
+
+class NodeFPCrossAttention(nn.Module):
+    """
+    Crossed Attention Pass 2:
+        GCN 각 원자(Node_i)가 전역 FP 벡터를 참조하여 자신을 업데이트.
+
+    Pass 1 (GraphAttentionReadout) : FP(Q)    → N개 원자(K,V) → z_readout
+    Pass 2 (이 모듈)               : Node_i(Q) → FP(K,V)      → node_mat_updated
+
+    설계 근거 — Sigmoid 게이팅:
+        FP는 단일 토큰(시퀀스 길이 = 1)이므로 Softmax를 쓰면
+        항상 1.0으로 수렴 → 게이팅이 상수화됨.
+        Sigmoid 게이팅은 각 원자_i가 전역 FP 맥락을 얼마나 반영할지
+        독립적으로 [0, 1] 범위로 학습:
+            gate_i = σ( W_q(node_i) · W_k(fp) / √d )
+            node_i += gate_i * W_v(fp)
+
+    결과:
+        독성기(Toxicophore) 원자는 FP 전역 패턴과 강하게 공명 → 높은 gate
+        노이즈 원자는 FP와 무관 → gate ≈ 0 (자동 억제)
+    """
+    def __init__(self,
+                 node_dim: int   = config.GCN_OUT_DIM,
+                 fp_dim:   int   = config.PROJECT_DIM,
+                 dropout:  float = config.ATTN_DROPOUT):
+        super().__init__()
+        self.W_q   = nn.Linear(node_dim, node_dim, bias=False)
+        self.W_k   = nn.Linear(fp_dim,   node_dim, bias=False)
+        self.W_v   = nn.Linear(fp_dim,   node_dim, bias=False)
+        self.norm  = nn.LayerNorm(node_dim)
+        self.drop  = nn.Dropout(dropout)
+        self.scale = math.sqrt(node_dim)
+
+    def forward(self,
+                node_mat: torch.Tensor,
+                fp_vec:   torch.Tensor,
+                mask:     torch.Tensor) -> torch.Tensor:
+        """
+        node_mat : (B, N, node_dim) — GCN 출력 원자 행렬
+        fp_vec   : (B, fp_dim)      — 투영된 전역 FP 벡터 (단일 토큰)
+        mask     : (B, N)           — 유효 원자 True, 패딩 False
+        return   : (B, N, node_dim) — FP 맥락이 반영된 원자 행렬
+        """
+        Q = self.W_q(node_mat)               # (B, N, node_dim)
+        K = self.W_k(fp_vec).unsqueeze(1)    # (B, 1, node_dim)  — 단일 FP 토큰
+        V = self.W_v(fp_vec).unsqueeze(1)    # (B, 1, node_dim)
+
+        # 내적 스코어: 각 원자_i와 FP의 유사도
+        score = (Q * K).sum(dim=-1, keepdim=True) / self.scale  # (B, N, 1)
+        gate  = torch.sigmoid(score)                             # (B, N, 1) ∈ (0,1)
+
+        # 패딩 원자 게이트 제로화 (마스킹)
+        gate  = gate * mask.unsqueeze(-1).float()                # (B, N, 1)
+
+        # 각 원자가 FP 정보를 게이트 비율만큼 흡수
+        update = self.drop(gate * V)                             # (B, N, node_dim)
+
+        return self.norm(node_mat + update)                      # Residual + Norm
 
 
 # ─────────────────────────────────────────────────────────────
