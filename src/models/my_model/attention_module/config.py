@@ -13,7 +13,7 @@ _THIS_DIR  = os.path.dirname(os.path.abspath(__file__))          # attention_mod
 _MODEL_DIR = os.path.dirname(_THIS_DIR)                           # my_model/
 _REPO_ROOT = os.path.abspath(os.path.join(_MODEL_DIR, "..", "..", ".."))  # 프로젝트 루트
 
-DATA_PATH  = os.path.join(_REPO_ROOT, "data", "dilirank.csv")   # 원본 데이터
+DATA_PATH  = os.path.join(_REPO_ROOT, "data", "/app/src/models/stackdili/Data/Dataset.csv")   # 원본 데이터
 OUTPUT_DIR = os.path.join(_MODEL_DIR, "outputs")                 # 출력 결과물들 폴더
 
 # 모델 학습에 필요한 임베딩 파일들->지은이가 사용
@@ -30,8 +30,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ─────────────────────────────────────────────
 # 2. 데이터 설정
 # ─────────────────────────────────────────────
-SMILES_COL  = "smiles"       # Dataset.csv 내 SMILES 열 이름 (StackDILI 형식)
-LABEL_COL   = "binary_label"        # Dataset.csv 내 라벨 열 이름 (0: non-DILI, 1: DILI)
+SMILES_COL  = "SMILES"       # Dataset.csv 내 SMILES 열 이름 (StackDILI 형식)
+LABEL_COL   = "Label"        # Dataset.csv 내 라벨 열 이름 (0: non-DILI, 1: DILI)
 TEST_SIZE   = 0.2                   # 사용할 테스트 셋 비율, f.e) 0.2 = 20%
 RANDOM_SEED = 42
 
