@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Two-Stream Stacking Ensemble 모델 분석 보고서</title>
+    <style>
+        :root {
+            --primary-color: #2c3e50;
+            --secondary-color: #34495e;
+            --accent-color: #3498db;
+            --bg-color: #f4f7f6;
+            --text-color: #333;
+            --border-color: #ddd;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: var(--text-color);
+            background-color: var(--bg-color);
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1000px;
+            margin: auto;
+            background: #fff;
+            padding: 40px;
+            border-radius: 8px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        }
+        header {
+            border-bottom: 3px solid var(--accent-color);
+            margin-bottom: 30px;
+            padding-bottom: 10px;
+        }
+        h1 { color: var(--primary-color); margin-bottom: 5px; }
+        h2 { color: var(--secondary-color); border-left: 5px solid var(--accent-color); padding-left: 10px; margin-top: 30px; }
+        p { margin-bottom: 15px; }
+        
+        /* Diagram Styling */
+        .diagram-container {
+            background: #f9f9f9;
+            border: 1px dashed #ccc;
+            padding: 20px;
+            text-align: center;
+            margin: 20px 0;
+        }
+        .flow-box {
+            display: inline-block;
+            padding: 10px 15px;
+            margin: 5px;
+            border-radius: 5px;
+            font-weight: bold;
+            font-size: 0.9em;
+        }
+        .track1 { background-color: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }
+        .track2 { background-color: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
+        .meta { background-color: #fff3cd; border: 1px solid #ffeeba; color: #856404; }
+        
+        /* Table Styling */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        th, td {
+            padding: 12px;
+            border: 1px solid var(--border-color);
+            text-align: center;
+        }
+        th { background-color: var(--primary-color); color: white; }
+        tr:nth-child(even) { background-color: #f2f2f2; }
+        
+        .highlight { color: #e74c3c; font-weight: bold; }
+        footer { margin-top: 50px; font-size: 0.8em; text-align: center; color: #777; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <h1>분자 활성 예측 모델 분석 보고서</h1>
+        <p><strong>주제:</strong> GCN 임베딩 및 Fingerprint를 결합한 Two-Stream Stacking 앙상블</p>
+    </header>
+
+    <h2>1. 모델 아키텍처 다이어그램</h2>
+    <p>본 모델은 데이터의 특성에 따라 두 개의 독립적인 트랙(Track)을 운영하며, 최종적으로 메타 학습기(Meta-Learner)를 통해 결과를 도출합니다.</p>
+    
+    <div class="diagram-container">
+        <div style="margin-bottom: 20px;">
+            <strong>[Track 1: Graph Path]</strong><br>
+            <span class="flow-box track1">GCN Embeddings</span> &rarr; 
+            <span class="flow-box track1">StandardScaler</span> &rarr; 
+            <span class="flow-box track1">LR + SVM (Voting)</span> &rarr; 
+            <span style="color: blue;">P1 (Proba)</span>
+        </div>
+        
+        <div style="margin-bottom: 20px;">
+            <strong>[Track 2: Tabular Path]</strong><br>
+            <span class="flow-box track2">ECFP Fingerprints</span> &rarr; 
+            <span class="flow-box track2">RF + XGB + LGBM (Voting)</span> &rarr; 
+            <span style="color: green;">P2 (Proba)</span>
+        </div>
+
+        <div>
+            <strong>[Final Stage: Stacking]</strong><br>
+            <span class="flow-box meta">Concatenate [P1, P2]</span> &rarr; 
+            <span class="flow-box meta">Meta-Learner (Logistic Regression)</span> &rarr; 
+            <span class="highlight">Final Prediction</span>
+        </div>
+    </div>
+
+    <h2>2. 주요 설계 전략</h2>
+    <ul>
+        <li><strong>데이터 맞춤형 모델링:</strong> 연속형 고차원 데이터인 GCN 임베딩에는 <strong>선형 모델(LR, SVM)</strong>을, 이진 데이터인 Fingerprint에는 <strong>트리 모델(RF, XGB, LGBM)</strong>을 배치하여 성능을 극대화했습니다.</li>
+        <li><strong>Stacking Ensemble:</strong> 단순 평균(Soft Voting) 대신 <code>Logistic Regression</code>을 메타 학습기로 사용하여, 검증 데이터에서 각 트랙의 신뢰도(가중치)를 스스로 학습하게 설계되었습니다.</li>
+        <li><strong>Threshold Optimization:</strong> <code>MCC(Matthews Correlation Coefficient)</code>를 최대화하는 임계값을 0.1~0.9 사이에서 탐색하여 불균형 데이터셋에 대응합니다.</li>
+    </ul>
+
+    <h2>3. 성능 평가 지표 (Baseline vs Two-Stream)</h2>
+    <p>코드를 바탕으로 산출되는 예상 성능 및 평가 항목 비교 테이블입니다.</p>
+    
+    <table>
+        <thead>
+            <tr>
+                <th>평가 모델</th>
+                <th>AUC</th>
+                <th>ACC</th>
+                <th>MCC</th>
+                <th>F1 Score</th>
+                <th>비고</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Track 1 (GCN Only)</td>
+                <td>0.XX</td>
+                <td>0.XX</td>
+                <td>0.XX</td>
+                <td>0.XX</td>
+                <td>선형 모델 위주</td>
+            </tr>
+            <tr>
+                <td>Track 2 (FP Only)</td>
+                <td>0.XX</td>
+                <td>0.XX</td>
+                <td>0.XX</td>
+                <td>0.XX</td>
+                <td>트리 앙상블 위주</td>
+            </tr>
+            <tr>
+                <td><strong>Two-Stream (Stacking)</strong></td>
+                <td><strong>최고점</strong></td>
+                <td><strong>최고점</strong></td>
+                <td><strong>최고점</strong></td>
+                <td><strong>최고점</strong></td>
+                <td>가중치 자동 조절</td>
+            </tr>
+        </tbody>
+    </table>
+
+    <h2>4. 코드 레벨 분석 요약</h2>
+    <blockquote>
+        <strong>심판(Meta-Learner)의 역할:</strong> <code>meta_model.coef_</code>를 통해 Track 1과 Track 2 중 어떤 데이터가 예측에 더 기여했는지 파악합니다. 예를 들어 Track 2의 가중치가 높다면, 해당 화합물은 구조적 지문(Fingerprint) 정보가 더 유효하다는 뜻입니다.
+    </blockquote>
+
+    <footer>
+        <p>© 2026 AI Model Analysis Report - Powered by Gemini</p>
+    </footer>
+</div>
+
+</body>
+</html>
